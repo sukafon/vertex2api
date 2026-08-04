@@ -1,8 +1,10 @@
 package config
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
@@ -16,6 +18,8 @@ import (
 
 type Config struct {
 	APIKeys                 []string
+	GeneratedAPIKey         string
+	APIKeyGenerationError   error
 	AllowUnauthenticated    bool
 	AllowCustomModelNames   bool
 	StatsKey                string
@@ -69,10 +73,17 @@ func Load() *Config {
 		CORSAllowOrigin:         strings.TrimSpace(getEnv("CORS_ALLOW_ORIGIN", "")),
 	}
 
-	// 解析逗号分隔的 API Key 数组
+	// 解析逗号分隔的 API Key 数组。未提供 API_KEY 时，为默认的鉴权模式
+	// 生成一个仅存在于本次进程生命周期内的随机密钥。
 	raw := getEnv("API_KEY", "")
 	if raw != "" {
 		cfg.APIKeys = parseEnvList(raw)
+	}
+	if len(cfg.APIKeys) == 0 && !cfg.AllowUnauthenticated {
+		cfg.GeneratedAPIKey, cfg.APIKeyGenerationError = generateAPIKey()
+		if cfg.APIKeyGenerationError == nil {
+			cfg.APIKeys = []string{cfg.GeneratedAPIKey}
+		}
 	}
 
 	return cfg
@@ -82,6 +93,9 @@ func Load() *Config {
 func (c *Config) Validate() error {
 	if c == nil {
 		return fmt.Errorf("configuration is nil")
+	}
+	if c.APIKeyGenerationError != nil {
+		return fmt.Errorf("generate API_KEY: %w", c.APIKeyGenerationError)
 	}
 	if len(c.APIKeys) == 0 && !c.AllowUnauthenticated {
 		return fmt.Errorf("API_KEY is required unless ALLOW_UNAUTHENTICATED=true")
@@ -161,6 +175,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("WRITE_TIMEOUT_SECONDS must be greater than zero")
 	}
 	return nil
+}
+
+const generatedAPIKeyPrefix = "sk-"
+
+func generateAPIKey() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("read secure random bytes: %w", err)
+	}
+	return generatedAPIKeyPrefix + hex.EncodeToString(bytes), nil
 }
 
 // ValidateKey 检查给定 key 是否在白名单中

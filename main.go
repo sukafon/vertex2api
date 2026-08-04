@@ -45,6 +45,9 @@ func run() error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
+	if cfg.GeneratedAPIKey != "" {
+		log.Info().Str("api_key", cfg.GeneratedAPIKey).Msg("API_KEY was not provided; generated a random API key")
+	}
 	log.Info().
 		Str("host", cfg.Host).
 		Str("port", cfg.Port).

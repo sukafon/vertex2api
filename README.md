@@ -2,9 +2,6 @@
 
 `vertex2api` 将 Google Cloud Console 使用的匿名 Vertex GraphQL 链路转换为 OpenAI、Gemini 和 Anthropic 风格的 HTTP API。项目重点是协议字段、流式事件、错误信封、工具 Schema 与 usage 的协议转换。
 
-> [!IMPORTANT]
-> 本项目使用的是非公开、无 SLA 的匿名 Vertex/GraphQL 与 reCAPTCHA 浏览器链路，不是 Google 官方 SDK 或受支持的 Vertex AI 接入方式。上游页面、查询签名或风控策略变化都可能导致服务失效。使用者应自行确认其使用方式符合适用的服务条款、法律和网络策略。
-
 ## 已实现接口
 
 | 接口 | 路径 |
@@ -27,7 +24,7 @@
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少替换 API_KEY、GRAPHQL_API_KEY 和 RECAPTCHA_KEY
+# 可将 API_KEY 替换为固定密钥；删除该变量则启动时自动生成
 go run .
 ```
 
@@ -75,7 +72,7 @@ curl http://127.0.0.1:8080/v1/messages \
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `API_KEY` | 无 | API 密钥，多个值用逗号分隔；默认必须配置 |
+| `API_KEY` | 未提供时随机生成 | API 密钥，多个值用逗号分隔；省略时生成 `sk-` 开头的随机密钥并打印到启动日志 |
 | `ALLOW_UNAUTHENTICATED` | `false` | 显式允许无鉴权运行，仅建议本地开发使用 |
 | `ALLOW_CUSTOM_MODEL_NAMES` | `false` | 是否允许调用不在当前模型目录中的模型名称；开启后仍拒绝路径分隔符和 `..` 序列 |
 | `STATS_KEY` | 无 | `/v1/stats` 独立密钥；留空时该接口不可用 |
@@ -98,7 +95,7 @@ curl http://127.0.0.1:8080/v1/messages \
 | `REDACT_UPSTREAM_LOGS` | `false` | 是否将上游错误/响应详情替换为 `[REDACTED]` |
 | `CORS_ALLOW_ORIGIN` | 无 | 浏览器跨域 Origin；默认不授权跨域，谨慎使用 `*` |
 
-密钥可通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传递，`API_KEY` 和 `STATS_KEY` 至少需要 16 个字符。生产环境应使用足够随机的密钥，并通过反向代理启用 TLS、限流和访问日志脱敏。
+密钥可通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传递；手动设置的 `API_KEY` 和 `STATS_KEY` 至少需要 16 个字符。自动生成的 `API_KEY` 只存在于当前进程内，重启后会重新生成；生产环境建议手动设置固定密钥，并通过反向代理启用 TLS、限流和访问日志脱敏。
 
 ## 模型目录
 
@@ -115,11 +112,10 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TZ=Asia/Shanghai \
-  -e API_KEY=YOUR_API_KEY_AT_LEAST_16_CHARS \
   sukafon6/vertex2api:latest
 ```
 
-容器启动后，通过 `http://127.0.0.1:8080` 访问；健康检查地址为 `http://127.0.0.1:8080/health`。如需使用其他宿主机端口，只需修改 `-p` 左侧端口，例如 `-p 28888:8080`。如需让其他机器访问，应在宿主机防火墙和反向代理层配置 TLS、限流及访问控制。
+容器启动后，如果没有提供 `API_KEY`，程序会生成一个 `sk-` 开头的随机密钥并打印到容器日志；如需固定密钥，可额外添加 `-e API_KEY=YOUR_API_KEY_AT_LEAST_16_CHARS`。通过 `http://127.0.0.1:8080` 访问；健康检查地址为 `http://127.0.0.1:8080/health`。如需使用其他宿主机端口，只需修改 `-p` 左侧端口，例如 `-p 28888:8080`。如需让其他机器访问，应在宿主机防火墙和反向代理层配置 TLS、限流及访问控制。
 
 常用管理命令：
 

@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +68,43 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 	}
 	if cfg.AllowCustomModelNames {
 		t.Fatal("ALLOW_CUSTOM_MODEL_NAMES default = true, want false")
+	}
+}
+
+func TestLoadGeneratesAPIKeyWhenMissing(t *testing.T) {
+	t.Setenv("API_KEY", "")
+	t.Setenv("ALLOW_UNAUTHENTICATED", "false")
+
+	cfg := Load()
+	if cfg.GeneratedAPIKey == "" {
+		t.Fatal("GeneratedAPIKey is empty")
+	}
+	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0] != cfg.GeneratedAPIKey {
+		t.Fatalf("APIKeys = %#v, want the generated API key", cfg.APIKeys)
+	}
+	if !strings.HasPrefix(cfg.GeneratedAPIKey, generatedAPIKeyPrefix) {
+		t.Fatalf("generated API key = %q, want %q prefix", cfg.GeneratedAPIKey, generatedAPIKeyPrefix)
+	}
+	if len(cfg.GeneratedAPIKey) != len(generatedAPIKeyPrefix)+64 {
+		t.Fatalf("generated API key length = %d, want %d", len(cfg.GeneratedAPIKey), len(generatedAPIKeyPrefix)+64)
+	}
+	for _, char := range cfg.GeneratedAPIKey[len(generatedAPIKeyPrefix):] {
+		if !strings.ContainsRune("0123456789abcdef", char) {
+			t.Fatalf("generated API key contains non-hex character %q", char)
+		}
+	}
+}
+
+func TestLoadDoesNotGenerateAPIKeyForExplicitUnauthenticatedMode(t *testing.T) {
+	t.Setenv("API_KEY", "")
+	t.Setenv("ALLOW_UNAUTHENTICATED", "true")
+
+	cfg := Load()
+	if cfg.GeneratedAPIKey != "" {
+		t.Fatalf("GeneratedAPIKey = %q, want empty", cfg.GeneratedAPIKey)
+	}
+	if len(cfg.APIKeys) != 0 {
+		t.Fatalf("APIKeys = %#v, want empty", cfg.APIKeys)
 	}
 }
 
