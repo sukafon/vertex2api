@@ -1,0 +1,16 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.idea
+.vscode
+coverage
+dist
+prod
+scratch
+vertex2api
+vertex2api.exe
+tmp.exe
+model.json
+*.log

@@ -1,0 +1,38 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Go build and test output
+/vertex2api
+/vertex2api.exe
+*.test
+*.out
+/coverage/
+/dist/
+/prod/
+/bin/
+/build/
+/tmp.exe
+*.log
+*.zip
+*.tar
+*.tar.gz
+
+# Optional/generated model snapshots
+/model.json
+/models_openai_list.json
+/models_gemini_list.json
+
+# Local experiments
+/docker.txt
+/vertex_ai_anonymous.py
+/scratch/
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

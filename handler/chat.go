@@ -1,0 +1,1104 @@
+package handler
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"vertex2api/model"
+	"vertex2api/proxy"
+	schemanorm "vertex2api/schema"
+
+	"github.com/bytedance/sonic"
+	"github.com/rs/zerolog/log"
+)
+
+// ChatCompletions 处理 POST /v1/chat/completions
+func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req model.ChatCompletionRequest
+		_, ok := readJSONRequest(w, r, &req)
+		if !ok {
+			return
+		}
+
+		if message := validateModelName(req.Model, allowCustomModelNames); message != "" {
+			WriteJSON(w, http.StatusBadRequest, model.ErrorResponse{Error: &model.APIError{
+				Message: message,
+				Type:    "invalid_request_error",
+			}})
+			return
+		}
+
+		if message := validateOpenAIRequest(req); message != "" {
+			WriteJSON(w, http.StatusBadRequest, model.ErrorResponse{Error: &model.APIError{
+				Message: message,
+				Type:    "invalid_request_error",
+			}})
+			return
+		}
+
+		// 转换 OpenAI messages → Vertex contents
+		contents, systemInstruction := convertMessages(req.Model, req.Messages)
+
+		// 构建 generationConfig
+		genConfig := map[string]interface{}{}
+		if req.Temperature != nil {
+			genConfig["temperature"] = *req.Temperature
+		}
+		if req.TopP != nil {
+			genConfig["topP"] = *req.TopP
+		}
+		var maxTokens int
+		if req.MaxCompletionTokens != nil {
+			maxTokens = *req.MaxCompletionTokens
+		} else if req.MaxTokens != nil {
+			maxTokens = *req.MaxTokens
+		}
+		if maxTokens > 0 {
+			genConfig["maxOutputTokens"] = maxTokens
+		}
+		if stopSequences := openAIStopSequences(req.Stop); len(stopSequences) > 0 {
+			genConfig["stopSequences"] = stopSequences
+		}
+		if req.FrequencyPenalty != nil {
+			genConfig["frequencyPenalty"] = *req.FrequencyPenalty
+		}
+		if req.PresencePenalty != nil {
+			genConfig["presencePenalty"] = *req.PresencePenalty
+		}
+		if req.Seed != nil {
+			genConfig["seed"] = *req.Seed
+		}
+		if req.N != nil && *req.N > 1 {
+			genConfig["candidateCount"] = *req.N
+		}
+		applyOpenAIResponseFormat(genConfig, req.ResponseFormat)
+		options := buildOpenAIRequestOptions(req)
+
+		if req.Stream {
+			bodyJSON, tokenLease, err := vp.BuildBodyWithTokenWithOptionsContext(r.Context(), req.Model, contents, genConfig, nil, systemInstruction, options)
+			if err != nil {
+				if requestContextCanceled(r.Context(), err) {
+					log.Debug().Err(err).Str("model", req.Model).Msg("OpenAI stream request canceled before upstream call")
+					return
+				}
+				log.Error().Err(err).Str("model", req.Model).Msg("Build Vertex request failed")
+				WriteJSON(w, http.StatusInternalServerError, publicServerErrorResponse(err))
+				return
+			}
+			streamResponseForRequestWithProxy(w, r, req, vp, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
+				return vp.StreamWithTokenContext(ctx, bodyJSON, tokenLease, onChunk)
+			})
+			return
+		}
+
+		result, err := vp.CallWithTokenWithOptionsContext(r.Context(), req.Model, contents, genConfig, nil, systemInstruction, options)
+		if err != nil {
+			if requestContextCanceled(r.Context(), err) {
+				log.Debug().Err(err).Str("model", req.Model).Msg("OpenAI request canceled")
+				return
+			}
+			log.Error().Str("err", vp.UpstreamLogError(err)).Str("model", req.Model).Msg("Vertex API call failed")
+			writeUpstreamProtocolError(w, r, err)
+			return
+		}
+
+		sendChatResponse(w, req, req.Model, result)
+	})
+}
+
+func validateOpenAIRequest(req model.ChatCompletionRequest) string {
+	if strings.TrimSpace(req.Model) == "" {
+		return "model is required"
+	}
+	if len(req.Messages) == 0 {
+		return "messages is required"
+	}
+	for _, message := range req.Messages {
+		switch strings.ToLower(strings.TrimSpace(message.Role)) {
+		case "user", "assistant", "system", "developer", "tool":
+		default:
+			return "messages roles must be user, assistant, system, developer, or tool"
+		}
+	}
+	if req.N != nil && (*req.N < 1 || *req.N > 128) {
+		return "n must be between 1 and 128"
+	}
+	if (req.MaxTokens != nil && *req.MaxTokens < 1) || (req.MaxCompletionTokens != nil && *req.MaxCompletionTokens < 1) {
+		return "max_tokens and max_completion_tokens must be greater than zero"
+	}
+	if req.Stream && req.N != nil && *req.N > 1 {
+		return "n greater than 1 is not supported for streaming"
+	}
+	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
+		return "temperature must be between 0 and 2"
+	}
+	if req.TopP != nil && (*req.TopP < 0 || *req.TopP > 1) {
+		return "top_p must be between 0 and 1"
+	}
+	for name, value := range map[string]*float64{
+		"frequency_penalty": req.FrequencyPenalty,
+		"presence_penalty":  req.PresencePenalty,
+	} {
+		if value != nil && (*value < -2 || *value > 2) {
+			return name + " must be between -2 and 2"
+		}
+	}
+	if req.Stop != nil {
+		stopSequences := openAIStopSequences(req.Stop)
+		if len(stopSequences) == 0 || len(stopSequences) > 4 {
+			return "stop must be a string or an array of up to 4 strings"
+		}
+	}
+	if len(req.ResponseFormat) > 0 {
+		formatType, _ := req.ResponseFormat["type"].(string)
+		switch formatType {
+		case "text", "json_object":
+		case "json_schema":
+			jsonSchema, ok := req.ResponseFormat["json_schema"].(map[string]interface{})
+			if !ok || jsonSchema["schema"] == nil {
+				return "response_format.json_schema.schema is required"
+			}
+		default:
+			return "response_format.type must be text, json_object, or json_schema"
+		}
+	}
+	return ""
+}
+
+func openAIStopSequences(value interface{}) []string {
+	switch typed := value.(type) {
+	case string:
+		if typed != "" {
+			return []string{typed}
+		}
+	case []interface{}:
+		result := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok && text != "" {
+				result = append(result, text)
+			}
+		}
+		return result
+	case []string:
+		return typed
+	}
+	return nil
+}
+
+func applyOpenAIResponseFormat(genConfig map[string]interface{}, responseFormat map[string]interface{}) {
+	formatType, _ := responseFormat["type"].(string)
+	switch formatType {
+	case "json_object":
+		genConfig["responseMimeType"] = "application/json"
+	case "json_schema":
+		genConfig["responseMimeType"] = "application/json"
+		if jsonSchema, ok := responseFormat["json_schema"].(map[string]interface{}); ok {
+			if schemaValue, ok := jsonSchema["schema"]; ok {
+				genConfig["responseJsonSchema"] = schemanorm.Normalize(schemaValue)
+			}
+		}
+	}
+}
+
+func sendChatResponse(w http.ResponseWriter, req model.ChatCompletionRequest, modelName string, result *proxy.CallResult) {
+	usage, estimated := openAIUsage(req, result)
+	if estimated {
+		w.Header().Set("X-Usage-Estimated", "true")
+	}
+	choices := make([]model.ChatChoice, 0, maxInt(1, len(result.Candidates)))
+	if len(result.Candidates) > 0 {
+		for _, candidate := range result.Candidates {
+			candidateResult := callResultFromCandidate(candidate)
+			finishReason := openAIFinishReason(candidateResult)
+			choices = append(choices, model.ChatChoice{
+				Index:        candidate.Index,
+				Message:      buildOpenAIMessage(candidateResult),
+				FinishReason: &finishReason,
+			})
+		}
+	} else {
+		finishReason := openAIFinishReason(result)
+		choices = append(choices, model.ChatChoice{
+			Index:        0,
+			Message:      buildOpenAIMessage(result),
+			FinishReason: &finishReason,
+		})
+	}
+
+	resp := model.ChatCompletionResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: choices,
+		Usage:   usage,
+	}
+
+	WriteJSON(w, http.StatusOK, resp)
+}
+
+func callResultFromCandidate(candidate proxy.CandidateResult) *proxy.CallResult {
+	return &proxy.CallResult{
+		TextParts:         candidate.TextParts,
+		ImageParts:        candidate.ImageParts,
+		FunctionCalls:     candidate.FunctionCalls,
+		FinishReason:      candidate.FinishReason,
+		GroundingMetadata: candidate.GroundingMetadata,
+	}
+}
+
+func estimateOpenAIPromptTokens(req model.ChatCompletionRequest) int {
+	return estimateJSONTokens(map[string]interface{}{
+		"messages": req.Messages,
+		"tools":    req.Tools,
+	})
+}
+
+func estimateOpenAICompletionTokens(result *proxy.CallResult) int {
+	if result != nil && len(result.Candidates) > 0 {
+		total := 0
+		for _, candidate := range result.Candidates {
+			total += estimateOpenAICompletionTokens(callResultFromCandidate(candidate))
+		}
+		return total
+	}
+	if result == nil || (len(result.TextParts) == 0 && len(result.ImageParts) == 0 && len(result.FunctionCalls) == 0) {
+		return 0
+	}
+	return estimateTokenValue(map[string]interface{}{
+		"text":       result.TextParts,
+		"images":     result.ImageParts,
+		"tool_calls": result.FunctionCalls,
+	}, "")
+}
+
+func estimateReasoningTokens(result *proxy.CallResult) int {
+	if result == nil {
+		return 0
+	}
+	if len(result.Candidates) > 0 {
+		total := 0
+		for _, candidate := range result.Candidates {
+			total += estimateReasoningTokens(callResultFromCandidate(candidate))
+		}
+		return total
+	}
+	tokens := 0
+	for _, part := range result.TextParts {
+		if part.Thought {
+			tokens += estimateTextTokens(part.Text)
+		}
+	}
+	return tokens
+}
+
+func streamResponse(
+	w http.ResponseWriter,
+	r *http.Request,
+	modelName string,
+	stream func(context.Context, func(*proxy.CallResult) error) error,
+) {
+	streamResponseForRequest(w, r, model.ChatCompletionRequest{Model: modelName, Stream: true}, stream)
+}
+
+func streamResponseForRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	req model.ChatCompletionRequest,
+	stream func(context.Context, func(*proxy.CallResult) error) error,
+) {
+	streamResponseForRequestWithProxy(w, r, req, nil, stream)
+}
+
+func streamResponseForRequestWithProxy(
+	w http.ResponseWriter,
+	r *http.Request,
+	req model.ChatCompletionRequest,
+	vp *proxy.VertexProxy,
+	stream func(context.Context, func(*proxy.CallResult) error) error,
+) {
+	modelName := req.Model
+
+	finishReason := "stop"
+	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	streamState := &openAIStreamState{}
+	aggregate := &proxy.CallResult{}
+	committed := false
+
+	ctx := r.Context()
+	err := stream(ctx, func(result *proxy.CallResult) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if result == nil || result.IsEmpty() {
+			return nil
+		}
+		accumulateCallResult(aggregate, result)
+		if result.FinishReason != "" || len(result.FunctionCalls) > 0 {
+			finishReason = openAIFinishReason(result)
+		}
+		if !result.HasContent() {
+			return nil
+		}
+		if !committed {
+			setSSEHeaders(w)
+			committed = true
+		}
+		return writeOpenAIStreamChunk(w, id, modelName, result, streamState)
+	})
+	if err != nil {
+		if requestContextCanceled(ctx, err) {
+			log.Debug().Err(err).Str("model", modelName).Msg("OpenAI stream client disconnected")
+			return
+		}
+		log.Error().Str("err", upstreamLogError(vp, err)).Str("model", modelName).Msg("Vertex API stream failed")
+		if !committed {
+			writeUpstreamProtocolError(w, r, err)
+			return
+		}
+		_ = writeOpenAIStreamError(w, err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		log.Debug().Err(err).Str("model", modelName).Msg("OpenAI stream client disconnected")
+		return
+	}
+	if !committed {
+		setSSEHeaders(w)
+	}
+	var usage *model.Usage
+	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
+		usage, _ = openAIUsage(req, aggregate)
+	}
+	if err := writeOpenAIStreamEnd(w, id, modelName, finishReason, usage); err != nil {
+		if requestContextCanceled(ctx, err) {
+			log.Debug().Err(err).Str("model", modelName).Msg("OpenAI stream client disconnected")
+			return
+		}
+		log.Error().Err(err).Str("model", modelName).Msg("OpenAI stream end failed")
+	}
+}
+
+func accumulateCallResult(dst, src *proxy.CallResult) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.TextParts = append(dst.TextParts, src.TextParts...)
+	dst.ImageParts = append(dst.ImageParts, src.ImageParts...)
+	dst.FunctionCalls = append(dst.FunctionCalls, src.FunctionCalls...)
+	if src.FinishReason != "" {
+		dst.FinishReason = src.FinishReason
+	}
+	if len(src.UsageMetadata) > 0 {
+		dst.UsageMetadata = src.UsageMetadata
+	}
+}
+
+func writeOpenAIStreamChunk(w http.ResponseWriter, id, modelName string, result *proxy.CallResult, streamState *openAIStreamState) error {
+	chunk := model.ChatCompletionResponse{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: []model.ChatChoice{
+			{
+				Index: 0,
+				Delta: buildOpenAIDelta(result, streamState),
+			},
+		},
+	}
+
+	chunkData, _ := sonic.Marshal(chunk)
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(chunkData); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return err
+	}
+	return flushResponse(w)
+}
+
+func writeOpenAIStreamEnd(w http.ResponseWriter, id, modelName, finishReason string, usage *model.Usage) error {
+	endChunk := model.ChatCompletionResponse{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: []model.ChatChoice{
+			{
+				Index:        0,
+				Delta:        &model.ChatMessage{},
+				FinishReason: &finishReason,
+			},
+		},
+	}
+	endData, _ := sonic.Marshal(endChunk)
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(endData); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return err
+	}
+	if usage != nil {
+		usageChunk := model.ChatCompletionResponse{
+			ID:      id,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   modelName,
+			Choices: []model.ChatChoice{},
+			Usage:   usage,
+		}
+		usageData, _ := sonic.Marshal(usageChunk)
+		if _, err := io.WriteString(w, "data: "); err != nil {
+			return err
+		}
+		if _, err := w.Write(usageData); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, "\n\n"); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	return flushResponse(w)
+}
+
+func writeOpenAIStreamError(w http.ResponseWriter, streamErr error) error {
+	status := proxy.HTTPStatusForError(streamErr)
+	data, _ := sonic.Marshal(model.ErrorResponse{Error: &model.APIError{
+		Message: publicServerErrorMessageFor(streamErr),
+		Type:    openAIErrorType(status),
+	}})
+	if _, err := io.WriteString(w, "data: "); err != nil {
+		return err
+	}
+	if _, err := w.Write(data); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return err
+	}
+	return flushResponse(w)
+}
+
+func buildOpenAIMessage(result *proxy.CallResult) *model.ChatMessage {
+	content, reasoning := buildResponseContent(result)
+	var toolCalls []model.ChatToolCall
+	if result != nil {
+		toolCalls = buildOpenAIToolCalls(result.FunctionCalls, false)
+	}
+	msg := &model.ChatMessage{
+		Role:             "assistant",
+		Content:          content,
+		ReasoningContent: reasoning,
+		ToolCalls:        toolCalls,
+	}
+	if result != nil && result.GroundingMetadata != nil {
+		msg.Annotations = openAIAnnotationsFromGrounding(result.GroundingMetadata)
+	}
+	return msg
+}
+
+func buildOpenAIDelta(result *proxy.CallResult, streamState *openAIStreamState) *model.ChatMessage {
+	content, reasoning := buildStreamResponseContent(result)
+	role := ""
+	if streamState != nil && !streamState.hasIndexedContent {
+		streamState.hasIndexedContent = true
+		role = "assistant"
+	}
+	var toolCalls []model.ChatToolCall
+	if result != nil {
+		toolCalls = buildOpenAIToolCalls(result.FunctionCalls, true)
+	}
+	msg := &model.ChatMessage{
+		Role:             role,
+		Content:          content,
+		ReasoningContent: reasoning,
+		ToolCalls:        toolCalls,
+	}
+	if result != nil && result.GroundingMetadata != nil {
+		if streamState == nil || !streamState.emittedGrounding {
+			if streamState != nil {
+				streamState.emittedGrounding = true
+			}
+			msg.Annotations = openAIAnnotationsFromGrounding(result.GroundingMetadata)
+		}
+	}
+	return msg
+}
+
+func openAIAnnotationsFromGrounding(gm *model.GroundingMetadata) []model.ChatAnnotation {
+	if gm == nil || len(gm.GroundingChunks) == 0 || len(gm.GroundingSupports) == 0 {
+		return nil
+	}
+	var annotations []model.ChatAnnotation
+	for _, support := range gm.GroundingSupports {
+		if support.Segment == nil {
+			continue
+		}
+		for _, chunkIndex := range support.GroundingChunkIndices {
+			if chunkIndex < 0 || chunkIndex >= len(gm.GroundingChunks) || gm.GroundingChunks[chunkIndex].Web == nil {
+				continue
+			}
+			web := gm.GroundingChunks[chunkIndex].Web
+			annotations = append(annotations, model.ChatAnnotation{
+				Type: "url_citation",
+				URLCitation: &model.ChatURLCitation{
+					StartIndex: support.Segment.StartIndex,
+					EndIndex:   support.Segment.EndIndex,
+					URL:        web.URI,
+					Title:      web.Title,
+				},
+			})
+		}
+	}
+	return annotations
+}
+
+type openAIStreamState struct {
+	hasIndexedContent bool
+	emittedGrounding  bool
+}
+
+func generateOpenAIToolCallID(index int) string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("call_%x_%d", b, index)
+}
+
+func buildOpenAIToolCalls(functionCalls []model.FunctionCall, includeIndex bool) []model.ChatToolCall {
+	if len(functionCalls) == 0 {
+		return nil
+	}
+
+	toolCalls := make([]model.ChatToolCall, 0, len(functionCalls))
+	for i, functionCall := range functionCalls {
+		arguments := "{}"
+		if functionCall.Args != nil {
+			if data, err := sonic.Marshal(functionCall.Args); err == nil {
+				arguments = string(data)
+			}
+		}
+		toolCall := model.ChatToolCall{
+			ID:   openAIToolCallID(functionCall, i),
+			Type: "function",
+			Function: &model.ChatFunctionCall{
+				Name:      functionCall.Name,
+				Arguments: arguments,
+			},
+		}
+		if includeIndex {
+			index := i
+			toolCall.Index = &index
+		}
+		toolCalls = append(toolCalls, toolCall)
+	}
+	return toolCalls
+}
+
+func openAIFinishReason(result *proxy.CallResult) string {
+	if result != nil && len(result.FunctionCalls) > 0 {
+		return "tool_calls"
+	}
+	if result == nil {
+		return "stop"
+	}
+	switch strings.ToUpper(result.FinishReason) {
+	case "MAX_TOKENS":
+		return "length"
+	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY":
+		return "content_filter"
+	default:
+		return "stop"
+	}
+}
+
+const openAIToolSignatureMarker = "__vertex_sig_"
+
+func openAIToolCallID(functionCall model.FunctionCall, index int) string {
+	id := functionCall.ID
+	if id == "" {
+		id = generateOpenAIToolCallID(index)
+	}
+	if functionCall.ThoughtSignature == "" || strings.Contains(id, openAIToolSignatureMarker) {
+		return id
+	}
+	return id + openAIToolSignatureMarker + base64.RawURLEncoding.EncodeToString([]byte(functionCall.ThoughtSignature))
+}
+
+func buildOpenAIRequestOptions(req model.ChatCompletionRequest) *proxy.VertexRequestOptions {
+	tools := convertOpenAITools(req.Tools)
+	toolConfig := convertOpenAIToolChoice(req.ToolChoice)
+	if tools == nil && toolConfig == nil {
+		return nil
+	}
+	return &proxy.VertexRequestOptions{
+		Tools:      tools,
+		ToolConfig: toolConfig,
+	}
+}
+
+func convertOpenAITools(tools []map[string]interface{}) interface{} {
+	var converted []interface{}
+	var functionDeclarations []interface{}
+
+	for _, tool := range tools {
+		if function, ok := mapValue(tool, "function"); ok && isFunctionTool(tool) {
+			functionDeclarations = append(functionDeclarations, openAIFunctionDeclaration(function))
+			continue
+		}
+		if nativeTool, ok := convertNativeGeminiTool(tool); ok {
+			converted = append(converted, nativeTool)
+			continue
+		}
+		converted = append(converted, copyInterfaceMap(tool))
+	}
+	if len(functionDeclarations) > 0 {
+		converted = append(converted, map[string]interface{}{"functionDeclarations": functionDeclarations})
+	}
+	if len(converted) == 0 {
+		return nil
+	}
+	return converted
+}
+
+func isFunctionTool(tool map[string]interface{}) bool {
+	toolType, _ := tool["type"].(string)
+	return toolType == "function"
+}
+
+func openAIFunctionDeclaration(function map[string]interface{}) map[string]interface{} {
+	declaration := copyInterfaceMap(function)
+	delete(declaration, "strict")
+	return declaration
+}
+
+func convertOpenAIToolChoice(choice interface{}) interface{} {
+	switch v := choice.(type) {
+	case nil:
+		return nil
+	case string:
+		return functionCallingConfigForMode(openAIToolChoiceMode(v), nil)
+	case map[string]interface{}:
+		if config, ok := v["functionCallingConfig"]; ok {
+			return map[string]interface{}{"functionCallingConfig": config}
+		}
+		if function, ok := mapValue(v, "function"); ok {
+			if name, _ := function["name"].(string); name != "" {
+				return functionCallingConfigForMode("ANY", []string{name})
+			}
+		}
+	default:
+		return nil
+	}
+	return nil
+}
+
+func openAIToolChoiceMode(choice string) string {
+	switch strings.ToLower(strings.TrimSpace(choice)) {
+	case "none":
+		return "NONE"
+	case "auto":
+		return "AUTO"
+	case "required":
+		return "ANY"
+	default:
+		return ""
+	}
+}
+
+func functionCallingConfigForMode(mode string, allowedFunctionNames []string) interface{} {
+	if mode == "" {
+		return nil
+	}
+	config := map[string]interface{}{"mode": mode}
+	if len(allowedFunctionNames) > 0 {
+		config["allowedFunctionNames"] = allowedFunctionNames
+	}
+	return map[string]interface{}{"functionCallingConfig": config}
+}
+
+func mapValue(m map[string]interface{}, key string) (map[string]interface{}, bool) {
+	value, ok := m[key].(map[string]interface{})
+	return value, ok
+}
+
+func copyInterfaceMap(src map[string]interface{}) map[string]interface{} {
+	dst := make(map[string]interface{}, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+func buildResponseContent(result *proxy.CallResult) (content interface{}, reasoning string) {
+	if result == nil {
+		return "", ""
+	}
+	hasImages := len(result.ImageParts) > 0
+
+	if hasImages {
+		return buildMarkdownResponseContent(result), ""
+	}
+
+	var contentBuilder, reasoningBuilder strings.Builder
+	for _, part := range result.TextParts {
+		if part.Thought {
+			reasoningBuilder.WriteString(part.Text)
+		} else {
+			contentBuilder.WriteString(part.Text)
+		}
+	}
+
+	cStr := contentBuilder.String()
+	rStr := reasoningBuilder.String()
+	if cStr == "" && len(result.FunctionCalls) > 0 {
+		return nil, rStr
+	}
+	return cStr, rStr
+}
+
+func buildStreamResponseContent(result *proxy.CallResult) (content interface{}, reasoning string) {
+	if result == nil {
+		return nil, ""
+	}
+	hasImages := len(result.ImageParts) > 0
+	if hasImages {
+		return buildMarkdownResponseContent(result), ""
+	}
+
+	var contentBuilder, reasoningBuilder strings.Builder
+	for _, part := range result.TextParts {
+		if part.Thought {
+			reasoningBuilder.WriteString(part.Text)
+		} else {
+			contentBuilder.WriteString(part.Text)
+		}
+	}
+
+	cStr := contentBuilder.String()
+	rStr := reasoningBuilder.String()
+	if cStr == "" {
+		return nil, rStr
+	}
+	return cStr, rStr
+}
+
+func buildMarkdownResponseContent(result *proxy.CallResult) string {
+	var b strings.Builder
+	b.WriteString(joinTextParts(result.TextParts))
+
+	for _, img := range result.ImageParts {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("![image](")
+		b.WriteString(imageDataURL(img))
+		b.WriteString(")")
+	}
+
+	return b.String()
+}
+
+func imageDataURL(img model.InlineData) string {
+	mimeType := img.MimeType
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+	return fmt.Sprintf("data:%s;base64,%s", mimeType, img.Data)
+}
+
+func joinTextParts(parts []model.TextPart) string {
+	var b strings.Builder
+	for _, part := range parts {
+		b.WriteString(part.Text)
+	}
+	return b.String()
+}
+
+func convertMessages(modelName string, messages []model.ChatMessage) ([]map[string]interface{}, interface{}) {
+	var contents []map[string]interface{}
+	var systemInstruction interface{}
+	var systemParts []map[string]interface{}
+	toolCallNames := make(map[string]string)
+
+	scanOpenAIToolCallNames(messages, toolCallNames)
+
+	var lastModelFunctionName string
+	for _, msg := range messages {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role == "system" || role == "developer" {
+			text := extractTextContent(msg.Content)
+			if text != "" {
+				systemParts = append(systemParts, map[string]interface{}{"text": text})
+			}
+			continue
+		}
+
+		var vertexRole string
+		var parts []map[string]interface{}
+
+		if role == "tool" {
+			vertexRole = "user"
+			name := msg.Name
+			if name == "" && msg.ToolCallID != "" {
+				name = toolCallNames[msg.ToolCallID]
+			}
+			if name == "" && !strings.HasPrefix(msg.ToolCallID, "call_") {
+				name = msg.ToolCallID
+			}
+			if (name == "" || strings.HasPrefix(name, "call_")) && lastModelFunctionName != "" {
+				name = lastModelFunctionName
+			}
+			if name == "" || strings.HasPrefix(name, "call_") {
+				log.Warn().Str("tool_call_id", msg.ToolCallID).Msg("convertMessages: unable to resolve function name for OpenAI tool call, falling back to text part")
+				parts = []map[string]interface{}{
+					{"text": fmt.Sprintf("[Tool Result (%s)]: %s", msg.ToolCallID, extractTextContent(msg.Content))},
+				}
+			} else {
+				parts = []map[string]interface{}{
+					{
+						"functionResponse": map[string]interface{}{
+							"name":     name,
+							"response": parseFunctionResponseContent(msg.Content),
+						},
+					},
+				}
+			}
+		} else {
+			vertexRole = role
+			if vertexRole == "assistant" {
+				vertexRole = "model"
+			}
+			parts = convertContentToParts(msg.Content)
+			for _, toolCall := range msg.ToolCalls {
+				if toolCall.ID != "" && toolCall.Function != nil {
+					toolCallNames[toolCall.ID] = toolCall.Function.Name
+				}
+				if functionPart := convertToolCallToFunctionCallPart(toolCall); functionPart != nil {
+					parts = append(parts, functionPart)
+				}
+			}
+			if vertexRole == "model" {
+				for _, p := range parts {
+					if fc, ok := p["functionCall"].(map[string]interface{}); ok {
+						if fname, _ := fc["name"].(string); fname != "" {
+							lastModelFunctionName = fname
+						}
+					}
+				}
+			}
+		}
+
+		if len(parts) == 0 {
+			continue
+		}
+
+		if len(contents) > 0 && contents[len(contents)-1]["role"] == vertexRole {
+			prevParts, _ := contents[len(contents)-1]["parts"].([]map[string]interface{})
+			contents[len(contents)-1]["parts"] = append(prevParts, parts...)
+		} else {
+			contents = append(contents, map[string]interface{}{
+				"role":  vertexRole,
+				"parts": parts,
+			})
+		}
+	}
+	if len(systemParts) > 0 {
+		systemInstruction = map[string]interface{}{"parts": systemParts}
+	}
+
+	return contents, systemInstruction
+}
+
+func scanOpenAIToolCallNames(messages []model.ChatMessage, toolCallNames map[string]string) {
+	for _, msg := range messages {
+		for _, toolCall := range msg.ToolCalls {
+			if toolCall.ID != "" && toolCall.Function != nil && toolCall.Function.Name != "" {
+				toolCallNames[toolCall.ID] = toolCall.Function.Name
+			}
+		}
+	}
+}
+
+// extractTextContent 从 content 提取纯文本
+func convertToolCallToFunctionCallPart(toolCall model.ChatToolCall) map[string]interface{} {
+	if toolCall.Function == nil {
+		return nil
+	}
+	part := functionCallPart(toolCall.Function.Name, toolCall.Function.Arguments)
+	if signature := extractToolCallThoughtSignature(toolCall); signature != "" {
+		part["thoughtSignature"] = signature
+	} else {
+		part["thoughtSignature"] = anthropicDummyThoughtSignature
+	}
+	return part
+}
+
+func functionCallPart(name, arguments string) map[string]interface{} {
+	return map[string]interface{}{
+		"functionCall": map[string]interface{}{
+			"name": name,
+			"args": parseFunctionArguments(arguments),
+		},
+	}
+}
+
+func extractToolCallThoughtSignature(toolCall model.ChatToolCall) string {
+	if signature := thoughtSignatureFromExtraContent(toolCall.ExtraContent); signature != "" {
+		return signature
+	}
+	marker := strings.LastIndex(toolCall.ID, openAIToolSignatureMarker)
+	if marker < 0 {
+		return ""
+	}
+	encoded := toolCall.ID[marker+len(openAIToolSignatureMarker):]
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+func thoughtSignatureFromExtraContent(extraContent map[string]interface{}) string {
+	if extraContent == nil {
+		return ""
+	}
+	if signature, ok := extraContent["thoughtSignature"].(string); ok {
+		return signature
+	}
+	if google, ok := extraContent["google"].(map[string]interface{}); ok {
+		if signature, ok := google["thoughtSignature"].(string); ok {
+			return signature
+		}
+	}
+	return ""
+}
+
+func parseFunctionArguments(arguments string) map[string]interface{} {
+	arguments = strings.TrimSpace(arguments)
+	if arguments == "" {
+		return map[string]interface{}{}
+	}
+
+	var args map[string]interface{}
+	if err := sonic.Unmarshal([]byte(arguments), &args); err == nil {
+		return args
+	}
+
+	var value interface{}
+	if err := sonic.Unmarshal([]byte(arguments), &value); err == nil {
+		return map[string]interface{}{"value": value}
+	}
+	return map[string]interface{}{"arguments": arguments}
+}
+
+func parseFunctionResponseContent(content interface{}) map[string]interface{} {
+	text := strings.TrimSpace(extractTextContent(content))
+	if text == "" {
+		return map[string]interface{}{}
+	}
+
+	var response map[string]interface{}
+	if err := sonic.Unmarshal([]byte(text), &response); err == nil {
+		return response
+	}
+
+	var value interface{}
+	if err := sonic.Unmarshal([]byte(text), &value); err == nil {
+		return map[string]interface{}{"result": value}
+	}
+	return map[string]interface{}{"result": text}
+}
+
+func extractTextContent(content interface{}) string {
+	switch v := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []interface{}:
+		var texts []string
+		for _, item := range v {
+			if m, ok := item.(map[string]interface{}); ok {
+				if t, ok := m["text"].(string); ok {
+					texts = append(texts, t)
+				}
+			}
+		}
+		return strings.Join(texts, "\n")
+	}
+	return fmt.Sprintf("%v", content)
+}
+
+// convertContentToParts 将 OpenAI content 转换为 Vertex parts
+func convertContentToParts(content interface{}) []map[string]interface{} {
+	switch v := content.(type) {
+	case nil:
+		return nil
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []map[string]interface{}{{"text": v}}
+	case []interface{}:
+		var parts []map[string]interface{}
+		for _, item := range v {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			partType, _ := m["type"].(string)
+			switch partType {
+			case "text":
+				if text, ok := m["text"].(string); ok {
+					parts = append(parts, map[string]interface{}{"text": text})
+				}
+			case "image_url":
+				if imgURL, ok := m["image_url"].(map[string]interface{}); ok {
+					url, _ := imgURL["url"].(string)
+					mimeType, b64Data := parseDataURL(url)
+					if b64Data != "" {
+						parts = append(parts, map[string]interface{}{
+							"inlineData": map[string]interface{}{
+								"mimeType": mimeType,
+								"data":     b64Data,
+							},
+						})
+					}
+				}
+			}
+		}
+		return parts
+	}
+	return []map[string]interface{}{{"text": fmt.Sprintf("%v", content)}}
+}
+
+// parseDataURL 解析 data:mime;base64,DATA 格式的 URL
+func parseDataURL(dataURL string) (mimeType string, data string) {
+	if !strings.HasPrefix(dataURL, "data:") {
+		return "image/png", dataURL // 假设纯 base64
+	}
+	// data:image/png;base64,xxxxx
+	dataURL = strings.TrimPrefix(dataURL, "data:")
+	parts := strings.SplitN(dataURL, ";base64,", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "image/png", dataURL
+}
