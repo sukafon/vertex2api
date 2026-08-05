@@ -15,6 +15,7 @@
 /build/
 /tmp.exe
 *.log
+.vertex2api-api-key
 *.zip
 *.tar
 *.tar.gz

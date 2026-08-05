@@ -8,7 +8,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-ARG VERSION=dev
+ARG VERSION=1.0.2
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 ARG GOAMD64=v3
@@ -27,12 +27,15 @@ RUN apk add --no-cache ca-certificates tzdata \
 ARG GRAPHQL_API_KEY=AIzaSyCI-zsRP85UVOi0DjtiCwWBwQ1djDy741g
 ARG RECAPTCHA_KEY=6LdCjtspAAAAAMcV4TGdWLJqRTEk1TfpdLqEnKdj
 ENV GRAPHQL_API_KEY=${GRAPHQL_API_KEY} \
-    RECAPTCHA_KEY=${RECAPTCHA_KEY}
+    RECAPTCHA_KEY=${RECAPTCHA_KEY} \
+    API_KEY_FILE=/data/api-key
 
 WORKDIR /app
+RUN mkdir -p /data && chown vertex2api:vertex2api /data
 COPY --from=build --chown=vertex2api:vertex2api /out/vertex2api /app/vertex2api
 
 USER vertex2api
+VOLUME ["/data"]
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1

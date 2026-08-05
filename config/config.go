@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -20,6 +21,7 @@ type Config struct {
 	APIKeys                 []string
 	GeneratedAPIKey         string
 	APIKeyGenerationError   error
+	APIKeyFile              string
 	AllowUnauthenticated    bool
 	AllowCustomModelNames   bool
 	StatsKey                string
@@ -45,11 +47,14 @@ type Config struct {
 
 const DefaultVertexBaseURL = "https://cloudconsole-pa.clients6.google.com"
 
+const defaultAPIKeyFile = ".vertex2api-api-key"
+
 func Load() *Config {
 	if err := godotenv.Load(); err != nil {
 		log.Debug().Msg("No .env file found, using environment variables")
 	}
 	cfg := &Config{
+		APIKeyFile:              strings.TrimSpace(getEnv("API_KEY_FILE", defaultAPIKeyFile)),
 		AllowUnauthenticated:    getEnvBool("ALLOW_UNAUTHENTICATED", false),
 		AllowCustomModelNames:   getEnvBool("ALLOW_CUSTOM_MODEL_NAMES", false),
 		StatsKey:                getEnv("STATS_KEY", ""),
@@ -73,16 +78,33 @@ func Load() *Config {
 		CORSAllowOrigin:         strings.TrimSpace(getEnv("CORS_ALLOW_ORIGIN", "")),
 	}
 
-	// 解析逗号分隔的 API Key 数组。未提供 API_KEY 时，为默认的鉴权模式
-	// 生成一个仅存在于本次进程生命周期内的随机密钥。
+	// 解析逗号分隔的 API Key 数组。未提供 API_KEY 时，优先复用持久化密钥，
+	// 不存在时才生成并保存一个新的随机密钥。
 	raw := getEnv("API_KEY", "")
 	if raw != "" {
 		cfg.APIKeys = parseEnvList(raw)
 	}
 	if len(cfg.APIKeys) == 0 && !cfg.AllowUnauthenticated {
-		cfg.GeneratedAPIKey, cfg.APIKeyGenerationError = generateAPIKey()
-		if cfg.APIKeyGenerationError == nil {
-			cfg.APIKeys = []string{cfg.GeneratedAPIKey}
+		persistedKey, err := loadPersistedAPIKey(cfg.APIKeyFile)
+		if err != nil {
+			cfg.APIKeyGenerationError = fmt.Errorf("load persisted API_KEY: %w", err)
+		} else if persistedKey != "" {
+			cfg.APIKeys = []string{persistedKey}
+		} else {
+			generatedKey, generateErr := generateAPIKey()
+			if generateErr != nil {
+				cfg.APIKeyGenerationError = generateErr
+			} else {
+				persistedKey, persistErr := persistAPIKey(cfg.APIKeyFile, generatedKey)
+				if persistErr != nil {
+					cfg.APIKeyGenerationError = fmt.Errorf("persist API_KEY: %w", persistErr)
+				} else {
+					cfg.APIKeys = []string{persistedKey}
+					if persistedKey == generatedKey {
+						cfg.GeneratedAPIKey = generatedKey
+					}
+				}
+			}
 		}
 	}
 
@@ -185,6 +207,63 @@ func generateAPIKey() (string, error) {
 		return "", fmt.Errorf("read secure random bytes: %w", err)
 	}
 	return generatedAPIKeyPrefix + hex.EncodeToString(bytes), nil
+}
+
+func loadPersistedAPIKey(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", nil
+	}
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+
+	key := strings.TrimSpace(string(data))
+	if key == "" {
+		return "", nil
+	}
+	if len(parseEnvList(key)) != 1 || secretLength(key) < 16 {
+		return "", fmt.Errorf("%s contains an invalid API key", path)
+	}
+	return key, nil
+}
+
+func persistAPIKey(path, generatedKey string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return generatedKey, nil
+	}
+
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if os.IsExist(err) {
+		// Another process may have generated the key concurrently. Reuse the
+		// key that won the race instead of authenticating with an unpersisted key.
+		return loadPersistedAPIKey(path)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := file.WriteString(generatedKey + "\n"); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	return generatedKey, nil
 }
 
 // ValidateKey 检查给定 key 是否在白名单中

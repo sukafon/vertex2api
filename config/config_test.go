@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -74,6 +75,7 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 func TestLoadGeneratesAPIKeyWhenMissing(t *testing.T) {
 	t.Setenv("API_KEY", "")
 	t.Setenv("ALLOW_UNAUTHENTICATED", "false")
+	t.Setenv("API_KEY_FILE", filepath.Join(t.TempDir(), "api-key"))
 
 	cfg := Load()
 	if cfg.GeneratedAPIKey == "" {
@@ -92,6 +94,25 @@ func TestLoadGeneratesAPIKeyWhenMissing(t *testing.T) {
 		if !strings.ContainsRune("0123456789abcdef", char) {
 			t.Fatalf("generated API key contains non-hex character %q", char)
 		}
+	}
+}
+
+func TestLoadReusesPersistedAPIKey(t *testing.T) {
+	t.Setenv("API_KEY", "")
+	t.Setenv("ALLOW_UNAUTHENTICATED", "false")
+	t.Setenv("API_KEY_FILE", filepath.Join(t.TempDir(), "api-key"))
+
+	first := Load()
+	if first.GeneratedAPIKey == "" {
+		t.Fatal("first Load() did not generate an API key")
+	}
+
+	second := Load()
+	if second.GeneratedAPIKey != "" {
+		t.Fatal("second Load() generated a new API key instead of reusing the persisted key")
+	}
+	if len(second.APIKeys) != 1 || second.APIKeys[0] != first.GeneratedAPIKey {
+		t.Fatalf("second APIKeys = %#v, want persisted key %q", second.APIKeys, first.GeneratedAPIKey)
 	}
 }
 

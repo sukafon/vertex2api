@@ -24,7 +24,7 @@
 
 ```bash
 cp .env.example .env
-# 可将 API_KEY 替换为固定密钥；删除该变量则启动时自动生成
+# 可将 API_KEY 替换为固定密钥；删除该变量则首次启动时生成并持久化
 go run .
 ```
 
@@ -37,7 +37,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Authorization: Bearer your-random-secret' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.6-flash",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": false
   }'
@@ -46,7 +46,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ### Gemini 示例
 
 ```bash
-curl 'http://127.0.0.1:8080/v1beta/models/gemini-3.5-flash:generateContent' \
+curl 'http://127.0.0.1:8080/v1beta/models/gemini-3.6-flash:generateContent' \
   -H 'x-goog-api-key: your-random-secret' \
   -H 'Content-Type: application/json' \
   -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
@@ -60,7 +60,7 @@ curl http://127.0.0.1:8080/v1/messages \
   -H 'anthropic-version: 2023-06-01' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.6-flash",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "你好"}]
   }'
@@ -72,7 +72,9 @@ curl http://127.0.0.1:8080/v1/messages \
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `API_KEY` | 未提供时随机生成 | API 密钥，多个值用逗号分隔；省略时生成 `sk-` 开头的随机密钥并打印到启动日志 |
+| `API_KEY` | 未提供时自动生成并持久化 | API 密钥，多个值用逗号分隔；省略时首次生成 `sk-` 开头的随机密钥并保存到 `API_KEY_FILE` |
+| `API_KEY_FILE` | `.vertex2api-api-key` | 自动生成的 API 密钥持久化文件路径；手动设置 `API_KEY` 时不使用 |
+| `TZ` | `Asia/Shanghai` | 日志和自动拉取任务使用的时区；可填写其他 IANA 时区 |
 | `ALLOW_UNAUTHENTICATED` | `false` | 显式允许无鉴权运行，仅建议本地开发使用 |
 | `ALLOW_CUSTOM_MODEL_NAMES` | `false` | 是否允许调用不在当前模型目录中的模型名称；开启后仍拒绝路径分隔符和 `..` 序列 |
 | `STATS_KEY` | 无 | `/v1/stats` 独立密钥；留空时该接口不可用 |
@@ -95,7 +97,7 @@ curl http://127.0.0.1:8080/v1/messages \
 | `REDACT_UPSTREAM_LOGS` | `false` | 是否将上游错误/响应详情替换为 `[REDACTED]` |
 | `CORS_ALLOW_ORIGIN` | 无 | 浏览器跨域 Origin；默认不授权跨域，谨慎使用 `*` |
 
-密钥可通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传递；手动设置的 `API_KEY` 和 `STATS_KEY` 至少需要 16 个字符。自动生成的 `API_KEY` 只存在于当前进程内，重启后会重新生成；生产环境建议手动设置固定密钥，并通过反向代理启用 TLS、限流和访问日志脱敏。
+密钥可通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传递；手动设置的 `API_KEY` 和 `STATS_KEY` 至少需要 16 个字符。未设置 `API_KEY` 时，程序首次启动会生成密钥并写入 `API_KEY_FILE`，后续重启会复用该密钥；生产环境建议手动设置固定密钥，并通过反向代理启用 TLS、限流和访问日志脱敏。
 
 ## 模型目录
 
@@ -105,17 +107,47 @@ curl http://127.0.0.1:8080/v1/messages \
 
 镜像采用多阶段构建，运行时使用非 root 用户，也不会把本地 `.env` 复制进镜像。
 
+### 本地构建镜像
+
+如果不使用 Docker Hub，也可以直接从源码在本地构建镜像。以下命令适用于 WSL/Linux Bash，在项目根目录执行：
+
+```bash
+docker build --pull \
+  --build-arg VERSION=local \
+  --build-arg COMMIT="$(git rev-parse --short HEAD 2>/dev/null || printf 'local')" \
+  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t vertex2api:local \
+  .
+```
+
+最后的 `.` 表示当前项目目录，不能省略。构建时如果出现 `SecretsUsedInArgOrEnv` 提示，这是 Docker 对镜像内置公开浏览器链路标识的警告，不会阻止构建。
+
+本地构建完成后运行：
+
+```bash
+docker run -d \
+  --name vertex2api \
+  --restart unless-stopped \
+  -v vertex2api-data:/data \
+  -p 8080:8080 \
+  -e TZ=Asia/Shanghai \
+  vertex2api:local
+```
+
+### 使用 Docker Hub 镜像
+
 ```bash
 docker pull sukafon6/vertex2api:latest
 docker run -d \
   --name vertex2api \
   --restart unless-stopped \
+  -v vertex2api-data:/data \
   -p 8080:8080 \
   -e TZ=Asia/Shanghai \
   sukafon6/vertex2api:latest
 ```
 
-容器启动后，如果没有提供 `API_KEY`，程序会生成一个 `sk-` 开头的随机密钥并打印到容器日志；如需固定密钥，可额外添加 `-e API_KEY=YOUR_API_KEY_AT_LEAST_16_CHARS`。通过 `http://127.0.0.1:8080` 访问；健康检查地址为 `http://127.0.0.1:8080/health`。如需使用其他宿主机端口，只需修改 `-p` 左侧端口，例如 `-p 28888:8080`。如需让其他机器访问，应在宿主机防火墙和反向代理层配置 TLS、限流及访问控制。
+容器启动后，如果没有提供 `API_KEY`，程序会生成一个 `sk-` 开头的随机密钥并保存到 `/data/api-key`，同时打印到首次启动日志；命名卷 `vertex2api-data` 会让该密钥在容器重建后仍然保留。如需固定密钥，可额外添加 `-e API_KEY=YOUR_API_KEY_AT_LEAST_16_CHARS`。通过 `http://127.0.0.1:8080` 访问；健康检查地址为 `http://127.0.0.1:8080/health`。如需使用其他宿主机端口，只需修改 `-p` 左侧端口，例如 `-p 28888:8080`。如需让其他机器访问，应在宿主机防火墙和反向代理层配置 TLS、限流及访问控制。
 
 常用管理命令：
 
@@ -135,6 +167,8 @@ docker run -d \
   --name vertex2api \
   --restart unless-stopped \
   --env-file .env \
+  -e TZ=Asia/Shanghai \
+  -v vertex2api-data:/data \
   -p 8080:8080 \
   sukafon6/vertex2api:latest
 ```
