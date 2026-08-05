@@ -95,7 +95,10 @@ curl http://127.0.0.1:8080/v1/messages \
 | `AUTO_FETCH_MODELS` | `true` | 启动并定时拉取上游模型目录 |
 | `AUTO_FETCH_CRON` | `0 0,4 * * *` | 标准五段 Cron 表达式 |
 | `REDACT_UPSTREAM_LOGS` | `false` | 是否将上游错误/响应详情替换为 `[REDACTED]` |
+| `RANDOM_FINGERPRINT` | `false` | 是否为上游 reCAPTCHA/Vertex 请求使用随机浏览器请求指纹 |
 | `CORS_ALLOW_ORIGIN` | 无 | 浏览器跨域 Origin；默认不授权跨域，谨慎使用 `*` |
+
+上游 reCAPTCHA 和 Vertex 请求在 `RANDOM_FINGERPRINT=true` 时从 Chrome/Edge 131–147 的配置池中随机选择一组请求层浏览器指纹；同一次 reCAPTCHA 的 anchor/reload 请求复用该配置，每次新的上游重试重新选择。当前实现基于 HTTP 请求头，Go 标准库不会模拟浏览器 TLS ClientHello，因此不等同于完整的 TLS 指纹仿真。
 
 密钥可通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传递；手动设置的 `API_KEY` 和 `STATS_KEY` 至少需要 16 个字符。未设置 `API_KEY` 时，程序首次启动会生成密钥并写入 `API_KEY_FILE`，后续重启会复用该密钥；生产环境建议手动设置固定密钥，并通过反向代理启用 TLS、限流和访问日志脱敏。
 

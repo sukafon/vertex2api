@@ -58,6 +58,7 @@ func TestUpstreamLogValueHonorsRedactionAndTruncation(t *testing.T) {
 func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 	t.Setenv("AUTO_FETCH_MODELS", "")
 	t.Setenv("REDACT_UPSTREAM_LOGS", "")
+	t.Setenv("RANDOM_FINGERPRINT", "")
 	t.Setenv("ALLOW_CUSTOM_MODEL_NAMES", "")
 	cfg := Load()
 
@@ -67,8 +68,18 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 	if cfg.RedactUpstreamLogs {
 		t.Fatal("REDACT_UPSTREAM_LOGS default = true, want false")
 	}
+	if cfg.RandomFingerprint {
+		t.Fatal("RANDOM_FINGERPRINT default = true, want false")
+	}
 	if cfg.AllowCustomModelNames {
 		t.Fatal("ALLOW_CUSTOM_MODEL_NAMES default = true, want false")
+	}
+}
+
+func TestLoadCanEnableRandomFingerprint(t *testing.T) {
+	t.Setenv("RANDOM_FINGERPRINT", "true")
+	if cfg := Load(); !cfg.RandomFingerprint {
+		t.Fatal("RANDOM_FINGERPRINT = false, want true")
 	}
 }
 

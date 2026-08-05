@@ -25,6 +25,7 @@ import (
 	"vertex2api/stats"
 
 	"github.com/bytedance/sonic"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -1162,6 +1163,17 @@ func (vp *VertexProxy) upstreamLogError(err error) string {
 	return config.UpstreamLogError(err, redact, 120)
 }
 
+// withUpstreamError keeps the structured error field while applying the same
+// redaction policy used by the existing upstream log messages. Passing a
+// sanitized error to zerolog avoids leaking the raw upstream response when
+// REDACT_UPSTREAM_LOGS is enabled.
+func (vp *VertexProxy) withUpstreamError(event *zerolog.Event, err error) *zerolog.Event {
+	if err == nil {
+		return event
+	}
+	return event.Err(errors.New(vp.upstreamLogError(err)))
+}
+
 // UpstreamLogError applies the configured upstream error logging policy to
 // errors surfaced to protocol handlers.
 func (vp *VertexProxy) UpstreamLogError(err error) string {
@@ -1286,11 +1298,11 @@ func (vp *VertexProxy) call(ctx context.Context, bodyJSON []byte, tokenLease *re
 			continue
 		}
 
-		log.Error().Str("err", vp.upstreamLogError(lastErr)).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Recaptcha token refresh limit reached, retries exhausted")
+		vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Recaptcha token refresh limit reached, retries exhausted")
 		break
 	}
 
-	log.Error().Str("err", vp.upstreamLogError(lastErr)).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Vertex API call failed after retries")
+	vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Vertex API call failed after retries")
 	return nil, lastErr
 }
 
@@ -1450,11 +1462,11 @@ func (vp *VertexProxy) stream(ctx context.Context, bodyJSON []byte, tokenLease *
 			continue
 		}
 
-		log.Error().Str("err", vp.upstreamLogError(lastErr)).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Recaptcha token refresh limit reached, stream retries exhausted")
+		vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Recaptcha token refresh limit reached, stream retries exhausted")
 		break
 	}
 
-	log.Error().Str("err", vp.upstreamLogError(lastErr)).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Vertex API stream failed after retries")
+	vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Vertex API stream failed after retries")
 	return lastErr
 }
 
@@ -1497,8 +1509,27 @@ func (vp *VertexProxy) doStream(ctx context.Context, bodyJSON []byte, tokenLease
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", "https://console.cloud.google.com/")
+	if vp.cfg != nil && vp.cfg.RandomFingerprint {
+		// Select a fresh browser profile for every upstream attempt. The retry
+		// loops call doStream again, so a retry does not reuse the prior profile.
+		fingerprint := client.NewRandomFingerprint()
+		fingerprint.ApplyXHRHeaders(
+			req,
+			"application/json",
+			"*/*",
+			"https://console.cloud.google.com",
+			"https://console.cloud.google.com/",
+			"cross-site",
+		)
+		req.Header.Set("X-Goog-Authuser", "0")
+		req.Header.Set("X-Browser-Channel", "stable")
+		req.Header.Set("X-Browser-Copyright", "Copyright 2026 Google LLC. All Rights Reserved.")
+		req.Header.Set("X-Browser-Year", "2026")
+		req.Header.Set("X-Goog-Ext-353267353-Jspb", "[null,null,null,194274]")
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Referer", "https://console.cloud.google.com/")
+	}
 
 	resp, err := vp.httpClient.DoRaw(req)
 	if err != nil {

@@ -86,6 +86,7 @@ type TokenCache struct {
 	prefixBaseURLs     []string
 	recaptchaKey       string
 	redactUpstreamLogs bool
+	randomFingerprint  bool
 }
 
 func NewTokenCache(httpClient *client.HTTPClient, cfg *config.Config) *TokenCache {
@@ -95,6 +96,7 @@ func NewTokenCache(httpClient *client.HTTPClient, cfg *config.Config) *TokenCach
 		prefixBaseURLs:     cfg.PrefixRecaptchaBaseURLs,
 		recaptchaKey:       cfg.RecaptchaKey,
 		redactUpstreamLogs: cfg.RedactUpstreamLogs,
+		randomFingerprint:  cfg.RandomFingerprint,
 		tokens:             make(map[string]*cachedToken),
 	}
 }
@@ -226,6 +228,13 @@ func (tc *TokenCache) fetchToken(ctx context.Context) (string, string, error) {
 	cb := randomString(10)
 	baseURL := tc.selectedRecaptchaBaseURL()
 	recaptchaKey := tc.recaptchaKey
+	// Keep one browser profile for the anchor/reload pair when enabled. A new
+	// fetch (and therefore a new retry) selects another profile, matching the
+	// reference implementation's per-attempt emulation behavior.
+	var fingerprint client.Fingerprint
+	if tc.randomFingerprint {
+		fingerprint = client.NewRandomFingerprint()
+	}
 
 	anchorURL := fmt.Sprintf(
 		"%s/recaptcha/enterprise/anchor?ar=1&k=%s&co=%s&hl=%s&v=%s&size=invisible&anchor-ms=20000&execute-ms=15000&cb=%s",
@@ -240,6 +249,9 @@ func (tc *TokenCache) fetchToken(ctx context.Context) (string, string, error) {
 	anchorReq, err := http.NewRequestWithContext(ctx, "GET", anchorURL, nil)
 	if err != nil {
 		return "", "", fmt.Errorf("build anchor request: %w", err)
+	}
+	if tc.randomFingerprint {
+		fingerprint.ApplyNavigationHeaders(anchorReq)
 	}
 
 	anchorBody, statusCode, err := tc.httpClient.Do(anchorReq)
@@ -278,7 +290,18 @@ func (tc *TokenCache) fetchToken(ctx context.Context) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("build reload request: %w", err)
 	}
-	reloadReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if tc.randomFingerprint {
+		fingerprint.ApplyXHRHeaders(
+			reloadReq,
+			"application/x-www-form-urlencoded;charset=UTF-8",
+			"*/*",
+			strings.TrimRight(baseURL, "/"),
+			anchorURL,
+			"same-origin",
+		)
+	} else {
+		reloadReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 
 	reloadBody, statusCode, err := tc.httpClient.Do(reloadReq)
 	if err != nil {

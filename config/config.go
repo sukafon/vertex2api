@@ -42,6 +42,7 @@ type Config struct {
 	AutoFetchModels         bool
 	AutoFetchCron           string
 	RedactUpstreamLogs      bool
+	RandomFingerprint       bool
 	CORSAllowOrigin         string
 }
 
@@ -75,6 +76,7 @@ func Load() *Config {
 		AutoFetchModels:         getEnvBool("AUTO_FETCH_MODELS", true),
 		AutoFetchCron:           getEnv("AUTO_FETCH_CRON", "0 0,4 * * *"),
 		RedactUpstreamLogs:      getEnvBool("REDACT_UPSTREAM_LOGS", false),
+		RandomFingerprint:       getEnvBool("RANDOM_FINGERPRINT", false),
 		CORSAllowOrigin:         strings.TrimSpace(getEnv("CORS_ALLOW_ORIGIN", "")),
 	}
 
