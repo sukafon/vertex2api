@@ -6,7 +6,7 @@
 
 | 接口 | 路径 |
 | --- | --- |
-| OpenAI | `POST /v1/chat/completions`、`GET /v1/models`、`GET /v1/models/{model}`、`POST /v1/images/generations`、`POST /v1/images/edits` |
+| OpenAI | `POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/responses/compact`、`GET /v1/models`、`GET /v1/models/{model}`、`POST /v1/images/generations`、`POST /v1/images/edits` |
 | Gemini | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`；同时接受 `v1beta1` 和 `v1` 生成路径；`GET /v1beta/models` |
 | Anthropic | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
 
@@ -14,7 +14,10 @@
 
 - 将 OpenAI/Anthropic 工具 Schema 归一化为 Gemini 可接受的子集，不修改调用者的原始对象。
 - 保留 Gemini 候选边界、结束原因、工具调用、思考签名和原生候选元数据。
+- Chat Completions 的显式 `reasoning_effort` 会映射到 Gemini 3 `thinkingLevel` 或 Gemini 2.5 `thinkingBudget`；`xhigh` 会静默降级为 Gemini 可表达的 `high`，省略该字段时保留模型默认思考配置，不依据 token 上限自动降级。
 - 对 `gemini-3.6-*` 移除末尾 model 预填充，适配该版本不接受 model turn 结尾的请求约束；这不是把内容改写成 `systemInstruction`，其他模型保留原行为。
+- Responses 支持无状态字符串/输入项数组、文本与 data URL 图片、函数工具、custom、local_shell、shell、apply_patch、结构化输出和 SSE 生命周期事件；不实现 `previous_response_id`、后台任务或 OpenAI 托管工具。
+- `/v1/responses/compact` 与 `context_management.compact_threshold` 会调用当前 Vertex 模型生成状态检查点，再输出 AES-GCM 认证加密的 opaque compaction item。该 item 只保证由相同 API_KEY 列表配置的 vertex2api 实例解码，不能与 OpenAI 官方 compaction item 互换；修改密钥内容或顺序会使旧 item 失效。无密钥运行时使用进程内随机密钥，重启后旧 item 失效。
 
 每个接口只实现仓库中列出的字段和行为，未列出的字段不会被视为已生效。
 
@@ -42,6 +45,34 @@ curl http://127.0.0.1:8080/v1/chat/completions \
     "stream": false
   }'
 ```
+
+Responses（包括 Codex 使用的无状态工具循环）也可直接调用：
+
+```bash
+curl http://127.0.0.1:8080/v1/responses \
+  -H 'Authorization: Bearer your-random-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemini-3.6-flash",
+    "input": "检查当前目录中的 Go 测试",
+    "store": false,
+    "stream": false
+  }'
+```
+
+显式压缩一个无状态上下文窗口：
+
+```bash
+curl http://127.0.0.1:8080/v1/responses/compact \
+  -H 'Authorization: Bearer your-random-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemini-3.6-flash",
+    "input": [{"type":"message","role":"user","content":"继续之前的编码任务"}]
+  }'
+```
+
+把响应的 `output` 数组原样作为下一次 `/v1/responses` 的 `input` 前缀。服务端自动压缩则在普通 Responses 请求中添加 `"context_management":[{"type":"compaction","compact_threshold":200000}]`。
 
 ### Gemini 示例
 
@@ -95,10 +126,11 @@ curl http://127.0.0.1:8080/v1/messages \
 | `AUTO_FETCH_MODELS` | `true` | 启动并定时拉取上游模型目录 |
 | `AUTO_FETCH_CRON` | `0 0,4 * * *` | 标准五段 Cron 表达式 |
 | `REDACT_UPSTREAM_LOGS` | `false` | 是否将上游错误/响应详情替换为 `[REDACTED]` |
-| `RANDOM_FINGERPRINT` | `false` | 是否为上游 reCAPTCHA/Vertex 请求使用随机浏览器请求指纹 |
+| `RANDOM_FINGERPRINT` | `false` | 是否附加浏览器请求层 Header；TLS ClientHello 由 `TLS_CLIENT_PROFILE` 控制 |
+| `TLS_CLIENT_PROFILE` | `chrome_146` | `tls-client` 浏览器 TLS/HTTP2 profile |
 | `CORS_ALLOW_ORIGIN` | 无 | 浏览器跨域 Origin；默认不授权跨域，谨慎使用 `*` |
 
-上游 reCAPTCHA 和 Vertex 请求在 `RANDOM_FINGERPRINT=true` 时从 Chrome/Edge 131–147 的配置池中随机选择一组请求层浏览器指纹；同一次 reCAPTCHA 的 anchor/reload 请求复用该配置，每次新的上游重试重新选择。当前实现基于 HTTP 请求头，Go 标准库不会模拟浏览器 TLS ClientHello，因此不等同于完整的 TLS 指纹仿真。
+上游 reCAPTCHA 和 Vertex 请求默认使用 `tls-client` 的 Chrome profile，模拟 TLS ClientHello、HTTP/2 设置和请求层浏览器特征；`RANDOM_FINGERPRINT=true` 时额外附加请求层 Header。建议保持同一个 `TLS_CLIENT_PROFILE` 稳定使用，不要在每次重试时切换 profile。
 
 密钥可通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传递；手动设置的 `API_KEY` 和 `STATS_KEY` 至少需要 16 个字符。未设置 `API_KEY` 时，程序首次启动会生成密钥并写入 `API_KEY_FILE`，后续重启会复用该密钥；生产环境建议手动设置固定密钥，并通过反向代理启用 TLS、限流和访问日志脱敏。
 

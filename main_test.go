@@ -97,3 +97,22 @@ func TestApplicationRejectsTraversalBeforeAuthentication(t *testing.T) {
 		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestApplicationRegistersResponsesRoutes(t *testing.T) {
+	cfg := &config.Config{APIKeys: []string{"1234567890123456"}, AllowCustomModelNames: true}
+	app := newApplication(cfg, nil)
+
+	for _, path := range []string{"/v1/responses", "/v1/responses/compact"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"custom-model"}`))
+		req.Header.Set("Authorization", "Bearer 1234567890123456")
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		app.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400: %s", path, recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "input is required") {
+			t.Fatalf("%s did not reach Responses handler: %s", path, recorder.Body.String())
+		}
+	}
+}

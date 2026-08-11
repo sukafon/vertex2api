@@ -521,6 +521,64 @@ func TestValidateOpenAIRequestDistinguishesOmittedAndInvalidZeroValues(t *testin
 	}
 }
 
+func TestOpenAIReasoningConfigMapsExplicitEffort(t *testing.T) {
+	tests := []struct {
+		name      string
+		modelName string
+		effort    string
+		key       string
+		want      interface{}
+	}{
+		{name: "Gemini 3.6 minimal", modelName: "gemini-3.6-flash", effort: "minimal", key: "thinkingLevel", want: "MINIMAL"},
+		{name: "Gemini 3.6 xhigh degrades to high", modelName: "gemini-3.6-flash", effort: "xhigh", key: "thinkingLevel", want: "HIGH"},
+		{name: "Gemini 3 medium", modelName: "gemini-3-flash-preview", effort: "medium", key: "thinkingLevel", want: "MEDIUM"},
+		{name: "Gemini 3 Pro promotes minimal", modelName: "gemini-3.1-pro-preview", effort: "minimal", key: "thinkingLevel", want: "LOW"},
+		{name: "Gemini 2.5 low", modelName: "gemini-2.5-flash", effort: "low", key: "thinkingBudget", want: 1024},
+		{name: "Gemini 2.5 medium", modelName: "gemini-2.5-flash", effort: "medium", key: "thinkingBudget", want: 8192},
+		{name: "Gemini 2.5 high", modelName: "gemini-2.5-flash", effort: "high", key: "thinkingBudget", want: 24576},
+		{name: "Gemini 2.5 xhigh degrades to high", modelName: "gemini-2.5-flash", effort: "xhigh", key: "thinkingBudget", want: 24576},
+		{name: "Gemini 2.5 disables thinking", modelName: "gemini-2.5-flash", effort: "none", key: "thinkingBudget", want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			effort := tt.effort
+			if message := validateOpenAIReasoningEffort(tt.modelName, &effort); message != "" {
+				t.Fatalf("reasoning_effort rejected: %s", message)
+			}
+			config := openAIReasoningConfig(tt.modelName, &effort)
+			if len(config) != 1 {
+				t.Fatalf("thinking config = %#v, want one field", config)
+			}
+			if got := config[tt.key]; got != tt.want {
+				t.Fatalf("%s = %v, want %v", tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOpenAIReasoningEffortValidation(t *testing.T) {
+	if config := openAIReasoningConfig("gemini-3.6-flash", nil); config != nil {
+		t.Fatalf("omitted reasoning_effort produced config: %#v", config)
+	}
+
+	tests := []struct {
+		modelName string
+		effort    string
+	}{
+		{modelName: "gemini-3.6-flash", effort: "none"},
+		{modelName: "gemini-2.5-pro", effort: "none"},
+		{modelName: "gemini-3.6-flash", effort: "max"},
+		{modelName: "gemini-2.0-flash", effort: "high"},
+	}
+	for _, tt := range tests {
+		effort := tt.effort
+		if message := validateOpenAIReasoningEffort(tt.modelName, &effort); message == "" {
+			t.Fatalf("model=%s effort=%s should be rejected", tt.modelName, tt.effort)
+		}
+	}
+}
+
 func TestValidateOpenAIRequestRejectsUnsupportedMessageRole(t *testing.T) {
 	req := model.ChatCompletionRequest{
 		Model:    "gemini-test",

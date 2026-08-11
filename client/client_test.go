@@ -15,6 +15,23 @@ func TestNewRejectsMalformedProxy(t *testing.T) {
 	}
 }
 
+func TestNewUsesTLSClientProfile(t *testing.T) {
+	c, err := New(&config.Config{HTTPTimeoutSeconds: 5, TLSClientProfile: "chrome_146"})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer c.CloseIdleConnections()
+	if !c.UsesTLSClient() {
+		t.Fatal("New() did not configure tls-client")
+	}
+}
+
+func TestNewRejectsUnsupportedTLSClientProfile(t *testing.T) {
+	if _, err := New(&config.Config{TLSClientProfile: "chrome_unknown"}); err == nil {
+		t.Fatal("New() accepted an unsupported TLS client profile")
+	}
+}
+
 func TestDoRejectsOversizedBufferedResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "16777217")

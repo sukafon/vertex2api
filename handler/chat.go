@@ -63,6 +63,9 @@ func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Han
 		if maxTokens > 0 {
 			genConfig["maxOutputTokens"] = maxTokens
 		}
+		if thinkingConfig := openAIReasoningConfig(req.Model, req.ReasoningEffort); thinkingConfig != nil {
+			genConfig["thinkingConfig"] = thinkingConfig
+		}
 		if stopSequences := openAIStopSequences(req.Stop); len(stopSequences) > 0 {
 			genConfig["stopSequences"] = stopSequences
 		}
@@ -133,6 +136,9 @@ func validateOpenAIRequest(req model.ChatCompletionRequest) string {
 	if (req.MaxTokens != nil && *req.MaxTokens < 1) || (req.MaxCompletionTokens != nil && *req.MaxCompletionTokens < 1) {
 		return "max_tokens and max_completion_tokens must be greater than zero"
 	}
+	if message := validateOpenAIReasoningEffort(req.Model, req.ReasoningEffort); message != "" {
+		return message
+	}
 	if req.Stream && req.N != nil && *req.N > 1 {
 		return "n greater than 1 is not supported for streaming"
 	}
@@ -170,6 +176,65 @@ func validateOpenAIRequest(req model.ChatCompletionRequest) string {
 		}
 	}
 	return ""
+}
+
+func validateOpenAIReasoningEffort(modelName string, effort *string) string {
+	if effort == nil {
+		return ""
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(*effort))
+	switch normalized {
+	case "minimal", "low", "medium", "high", "xhigh":
+	case "none":
+		if strings.HasPrefix(strings.ToLower(modelName), "gemini-2.5-") && !strings.Contains(strings.ToLower(modelName), "pro") {
+			return ""
+		}
+		return "reasoning_effort none is not supported by this model"
+	default:
+		return "reasoning_effort must be none, minimal, low, medium, high, or xhigh"
+	}
+
+	lowerModel := strings.ToLower(modelName)
+	if !strings.HasPrefix(lowerModel, "gemini-3") && !strings.HasPrefix(lowerModel, "gemini-2.5-") {
+		return "reasoning_effort is only supported by Gemini 3 and Gemini 2.5 models"
+	}
+	return ""
+}
+
+func openAIReasoningConfig(modelName string, effort *string) map[string]interface{} {
+	if effort == nil {
+		return nil
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(*effort))
+	lowerModel := strings.ToLower(modelName)
+	if strings.HasPrefix(lowerModel, "gemini-3") {
+		level := strings.ToUpper(normalized)
+		if normalized == "xhigh" {
+			level = "HIGH"
+		}
+		// Gemini Pro models do not expose a minimal level; Google's OpenAI
+		// compatibility mapping promotes that request to low.
+		if normalized == "minimal" && strings.Contains(lowerModel, "pro") {
+			level = "LOW"
+		}
+		return map[string]interface{}{"thinkingLevel": level}
+	}
+
+	if strings.HasPrefix(lowerModel, "gemini-2.5-") {
+		budget := 0
+		switch normalized {
+		case "minimal", "low":
+			budget = 1024
+		case "medium":
+			budget = 8192
+		case "high", "xhigh":
+			budget = 24576
+		}
+		return map[string]interface{}{"thinkingBudget": budget}
+	}
+	return nil
 }
 
 func openAIStopSequences(value interface{}) []string {

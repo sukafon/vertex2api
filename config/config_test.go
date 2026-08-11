@@ -59,6 +59,7 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 	t.Setenv("AUTO_FETCH_MODELS", "")
 	t.Setenv("REDACT_UPSTREAM_LOGS", "")
 	t.Setenv("RANDOM_FINGERPRINT", "")
+	t.Setenv("TLS_CLIENT_PROFILE", "")
 	t.Setenv("ALLOW_CUSTOM_MODEL_NAMES", "")
 	cfg := Load()
 
@@ -70,6 +71,9 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 	}
 	if cfg.RandomFingerprint {
 		t.Fatal("RANDOM_FINGERPRINT default = true, want false")
+	}
+	if cfg.TLSClientProfile != "chrome_146" {
+		t.Fatalf("TLS_CLIENT_PROFILE default = %q, want chrome_146", cfg.TLSClientProfile)
 	}
 	if cfg.AllowCustomModelNames {
 		t.Fatal("ALLOW_CUSTOM_MODEL_NAMES default = true, want false")

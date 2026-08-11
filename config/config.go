@@ -43,6 +43,7 @@ type Config struct {
 	AutoFetchCron           string
 	RedactUpstreamLogs      bool
 	RandomFingerprint       bool
+	TLSClientProfile        string
 	CORSAllowOrigin         string
 }
 
@@ -77,6 +78,7 @@ func Load() *Config {
 		AutoFetchCron:           getEnv("AUTO_FETCH_CRON", "0 0,4 * * *"),
 		RedactUpstreamLogs:      getEnvBool("REDACT_UPSTREAM_LOGS", false),
 		RandomFingerprint:       getEnvBool("RANDOM_FINGERPRINT", false),
+		TLSClientProfile:        getEnv("TLS_CLIENT_PROFILE", "chrome_146"),
 		CORSAllowOrigin:         strings.TrimSpace(getEnv("CORS_ALLOW_ORIGIN", "")),
 	}
 

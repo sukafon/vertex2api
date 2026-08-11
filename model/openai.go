@@ -11,6 +11,7 @@ type ChatCompletionRequest struct {
 	TopP                *float64                 `json:"top_p,omitempty"`
 	MaxTokens           *int                     `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int                     `json:"max_completion_tokens,omitempty"`
+	ReasoningEffort     *string                  `json:"reasoning_effort,omitempty"`
 	Stop                interface{}              `json:"stop,omitempty"`
 	FrequencyPenalty    *float64                 `json:"frequency_penalty,omitempty"`
 	PresencePenalty     *float64                 `json:"presence_penalty,omitempty"`

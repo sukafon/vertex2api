@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -56,6 +57,7 @@ func run() error {
 		Int("api_keys", len(cfg.APIKeys)).
 		Int("max_retry", cfg.MaxRetry).
 		Int("max_refresh", cfg.MaxRefresh).
+		Str("tls_client_profile", cfg.TLSClientProfile).
 		Int("http_timeout_seconds", cfg.HTTPTimeoutSeconds).
 		Int("write_timeout_seconds", cfg.WriteTimeoutSeconds).
 		Bool("auto_fetch_models", cfg.AutoFetchModels).
@@ -111,9 +113,12 @@ func run() error {
 
 func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Handler {
 	mux := http.NewServeMux()
+	responsesAPI := handler.NewResponsesAPI(vertexProxy, cfg.AllowCustomModelNames, strings.Join(cfg.APIKeys, "\x00"))
 	mux.Handle("POST /v1/messages", handler.AnthropicMessages(vertexProxy, cfg.AllowCustomModelNames))
 	mux.Handle("POST /v1/messages/count_tokens", handler.AnthropicCountTokens(cfg.AllowCustomModelNames))
 	mux.Handle("POST /v1/chat/completions", handler.ChatCompletions(vertexProxy, cfg.AllowCustomModelNames))
+	mux.Handle("POST /v1/responses", responsesAPI.Responses())
+	mux.Handle("POST /v1/responses/compact", responsesAPI.Compact())
 	mux.Handle("POST /v1/images/generations", handler.ImageGenerations(vertexProxy, cfg.AllowCustomModelNames))
 	mux.Handle("POST /v1/images/edits", handler.ImageEdits(vertexProxy, cfg.AllowCustomModelNames))
 	mux.Handle("GET /v1/models", handler.ModelsList())
@@ -139,6 +144,8 @@ func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Han
 				"POST /v1/messages",
 				"POST /v1/messages/count_tokens",
 				"POST /v1/chat/completions",
+				"POST /v1/responses",
+				"POST /v1/responses/compact",
 				"POST /v1/images/generations",
 				"POST /v1/images/edits",
 				"GET  /v1/models",
