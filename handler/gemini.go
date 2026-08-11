@@ -19,6 +19,7 @@ import (
 // POST /v1beta1/models/{model}:streamGenerateContent
 func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerGeminiNative))
 		// 解析路径: modelAction = "gemini-2.0-flash:generateContent"
 		modelAction := r.PathValue("modelAction")
 		if modelAction == "" {
@@ -83,6 +84,10 @@ func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Hand
 
 		// 提取各字段，构建 Vertex 调用参数
 		genConfig, _ := geminiReq["generationConfig"].(map[string]interface{})
+		if geminiReq["modelArmorConfig"] != nil && geminiReq["safetySettings"] != nil {
+			WriteProtocolError(w, r, http.StatusBadRequest, "modelArmorConfig and safetySettings cannot be used together", "invalid_request_error")
+			return
+		}
 		safetySettings := toSafetySettings(geminiReq["safetySettings"])
 		safetySettings = model.SanitizeSafetySettings(modelName, safetySettings)
 		systemInstruction := geminiReq["systemInstruction"]
@@ -100,7 +105,7 @@ func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Hand
 					log.Debug().Err(err).Str("model", modelName).Msg("Gemini stream request canceled before upstream call")
 					return
 				}
-				log.Error().Err(err).Str("model", modelName).Msg("Build Gemini stream request failed")
+				log.Error().Err(err).Str("model", modelName).Msg("Gemini Native request conversion failed")
 				WriteJSON(w, http.StatusInternalServerError, geminiErrorResponse(err))
 				return
 			}
@@ -116,7 +121,7 @@ func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Hand
 				log.Debug().Err(err).Str("model", modelName).Msg("Gemini request canceled")
 				return
 			}
-			writeUpstreamProtocolError(w, r, err)
+			writeUpstreamProtocolError(w, r, vp, err)
 			return
 		}
 
@@ -148,7 +153,15 @@ func buildGeminiRequestOptions(req map[string]interface{}) *proxy.VertexRequestO
 	if toolConfig, ok := req["toolConfig"]; ok {
 		options.ToolConfig = toolConfig
 	}
-	if options.Tools == nil && options.ToolConfig == nil {
+	for _, key := range []string{"cachedContent", "labels", "modelArmorConfig"} {
+		if value, ok := req[key]; ok {
+			if options.AdditionalVariables == nil {
+				options.AdditionalVariables = make(map[string]interface{})
+			}
+			options.AdditionalVariables[key] = value
+		}
+	}
+	if options.Tools == nil && options.ToolConfig == nil && len(options.AdditionalVariables) == 0 {
 		return nil
 	}
 	return options
@@ -214,48 +227,63 @@ func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) m
 
 func buildGeminiCandidate(result *proxy.CallResult, defaultStop bool) map[string]interface{} {
 	var parts []map[string]interface{}
-	textParts := result.TextParts
-	if defaultStop {
-		textParts = coalesceGeminiTextParts(textParts)
+	if len(result.Parts) > 0 {
+		orderedParts := result.Parts
+		if defaultStop {
+			orderedParts = coalesceGeminiVertexParts(orderedParts)
+		}
+		for _, part := range orderedParts {
+			parts = append(parts, geminiPartMap(part))
+		}
+	}
+	if len(parts) == 0 {
+		textParts := result.TextParts
+		if defaultStop {
+			textParts = coalesceGeminiTextParts(textParts)
+		}
+
+		for _, textPart := range textParts {
+			part := map[string]interface{}{"text": textPart.Text}
+			if textPart.Thought {
+				part["thought"] = true
+			}
+			if textPart.ThoughtSignature != "" {
+				part["thoughtSignature"] = textPart.ThoughtSignature
+			}
+			parts = append(parts, part)
+		}
+		for _, img := range result.ImageParts {
+			parts = append(parts, map[string]interface{}{
+				"inlineData": map[string]interface{}{
+					"mimeType": img.MimeType,
+					"data":     img.Data,
+				},
+			})
+		}
+		for _, functionCall := range result.FunctionCalls {
+			call := map[string]interface{}{"name": functionCall.Name}
+			if functionCall.ID != "" {
+				call["id"] = functionCall.ID
+			}
+			if functionCall.Args != nil {
+				call["args"] = functionCall.Args
+			}
+			part := map[string]interface{}{"functionCall": call}
+			if functionCall.ThoughtSignature != "" {
+				part["thoughtSignature"] = functionCall.ThoughtSignature
+			}
+			parts = append(parts, part)
+		}
 	}
 
-	for _, textPart := range textParts {
-		part := map[string]interface{}{"text": textPart.Text}
-		if textPart.Thought {
-			part["thought"] = true
-		}
-		if textPart.ThoughtSignature != "" {
-			part["thoughtSignature"] = textPart.ThoughtSignature
-		}
-		parts = append(parts, part)
+	role := result.Role
+	if role == "" {
+		role = "model"
 	}
-	for _, img := range result.ImageParts {
-		parts = append(parts, map[string]interface{}{
-			"inlineData": map[string]interface{}{
-				"mimeType": img.MimeType,
-				"data":     img.Data,
-			},
-		})
-	}
-	for _, functionCall := range result.FunctionCalls {
-		call := map[string]interface{}{"name": functionCall.Name}
-		if functionCall.ID != "" {
-			call["id"] = functionCall.ID
-		}
-		if functionCall.Args != nil {
-			call["args"] = functionCall.Args
-		}
-		part := map[string]interface{}{"functionCall": call}
-		if functionCall.ThoughtSignature != "" {
-			part["thoughtSignature"] = functionCall.ThoughtSignature
-		}
-		parts = append(parts, part)
-	}
-
 	candidate := map[string]interface{}{
 		"content": map[string]interface{}{
 			"parts": parts,
-			"role":  "model",
+			"role":  role,
 		},
 	}
 	finishReason := result.FinishReason
@@ -272,6 +300,60 @@ func buildGeminiCandidate(result *proxy.CallResult, defaultStop bool) map[string
 	}
 
 	return candidate
+}
+
+func geminiPartMap(part model.VertexPart) map[string]interface{} {
+	result := make(map[string]interface{}, 4)
+	if part.Text != "" || (part.ThoughtSignature != "" && part.InlineData == nil && part.FunctionCall == nil && len(part.ExecutableCode) == 0 && len(part.CodeExecutionResult) == 0) {
+		result["text"] = part.Text
+	}
+	if part.InlineData != nil {
+		result["inlineData"] = part.InlineData
+	}
+	if len(part.FileData) > 0 {
+		result["fileData"] = part.FileData
+	}
+	if part.FunctionCall != nil {
+		result["functionCall"] = part.FunctionCall
+	}
+	if part.FunctionResponse != nil {
+		result["functionResponse"] = part.FunctionResponse
+	}
+	if len(part.ExecutableCode) > 0 {
+		result["executableCode"] = part.ExecutableCode
+	}
+	if len(part.CodeExecutionResult) > 0 {
+		result["codeExecutionResult"] = part.CodeExecutionResult
+	}
+	if len(part.VideoMetadata) > 0 {
+		result["videoMetadata"] = part.VideoMetadata
+	}
+	if part.Thought {
+		result["thought"] = true
+	}
+	if part.ThoughtSignature != "" {
+		result["thoughtSignature"] = part.ThoughtSignature
+	}
+	return result
+}
+
+func coalesceGeminiVertexParts(parts []model.VertexPart) []model.VertexPart {
+	if len(parts) <= 1 {
+		return parts
+	}
+	result := make([]model.VertexPart, 0, len(parts))
+	for _, part := range parts {
+		last := len(result) - 1
+		if last >= 0 && part.Text != "" && result[last].Text != "" && part.Thought == result[last].Thought &&
+			part.ThoughtSignature == "" && result[last].ThoughtSignature == "" && part.InlineData == nil &&
+			part.FunctionCall == nil && part.FunctionResponse == nil && len(part.FileData) == 0 &&
+			len(part.ExecutableCode) == 0 && len(part.CodeExecutionResult) == 0 {
+			result[last].Text += part.Text
+			continue
+		}
+		result = append(result, part)
+	}
+	return result
 }
 
 func coalesceGeminiTextParts(parts []model.TextPart) []model.TextPart {
@@ -333,12 +415,14 @@ func streamGeminiResponseWithProxy(
 			log.Debug().Err(err).Str("model", modelName).Msg("Gemini stream client disconnected")
 			return
 		}
-		log.Error().Str("err", upstreamLogError(vp, err)).Str("model", modelName).Msg("Gemini API stream failed")
+		if !proxy.IsUpstreamErrorLogged(err) {
+			log.Error().Str("err", upstreamLogError(vp, err)).Str("model", modelName).Msg("Gemini Native stream failed")
+		}
 		if !committed {
-			writeUpstreamProtocolError(w, r, err)
+			writeUpstreamProtocolError(w, r, vp, err)
 			return
 		}
-		_ = writeGeminiStreamError(w, err)
+		_ = writeGeminiStreamError(w, vp, err)
 		return
 	}
 	if !committed {
@@ -360,8 +444,8 @@ func writeGeminiStreamChunk(w http.ResponseWriter, result *proxy.CallResult) err
 	return flushResponse(w)
 }
 
-func writeGeminiStreamError(w http.ResponseWriter, streamErr error) error {
-	data, _ := sonic.Marshal(geminiErrorResponse(streamErr))
+func writeGeminiStreamError(w http.ResponseWriter, vp *proxy.VertexProxy, streamErr error) error {
+	data, _ := sonic.Marshal(geminiUpstreamErrorResponse(vp, streamErr))
 	if _, err := io.WriteString(w, "data: "); err != nil {
 		return err
 	}
@@ -375,11 +459,19 @@ func writeGeminiStreamError(w http.ResponseWriter, streamErr error) error {
 }
 
 func geminiErrorResponse(err error) map[string]interface{} {
+	return geminiErrorResponseWithMessage(err, publicServerErrorMessageFor(err))
+}
+
+func geminiUpstreamErrorResponse(vp *proxy.VertexProxy, err error) map[string]interface{} {
+	return geminiErrorResponseWithMessage(err, publicUpstreamErrorMessage(vp, err))
+}
+
+func geminiErrorResponseWithMessage(err error, message string) map[string]interface{} {
 	status := proxy.HTTPStatusForError(err)
 	return map[string]interface{}{
 		"error": map[string]interface{}{
 			"code":    status,
-			"message": publicServerErrorMessageFor(err),
+			"message": message,
 			"status":  geminiErrorStatus(status),
 		},
 	}

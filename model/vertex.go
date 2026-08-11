@@ -68,32 +68,41 @@ type VertexCandidate struct {
 }
 
 type GroundingMetadata struct {
-	WebSearchQueries  []string           `json:"webSearchQueries,omitempty"`
-	SearchEntryPoint  *SearchEntryPoint  `json:"searchEntryPoint,omitempty"`
-	GroundingChunks   []GroundingChunk   `json:"groundingChunks,omitempty"`
-	GroundingSupports []GroundingSupport `json:"groundingSupports,omitempty"`
-	RetrievalQueries  []string           `json:"retrievalQueries,omitempty"`
+	WebSearchQueries             []string                 `json:"webSearchQueries,omitempty"`
+	SearchEntryPoint             *SearchEntryPoint        `json:"searchEntryPoint,omitempty"`
+	GroundingChunks              []GroundingChunk         `json:"groundingChunks,omitempty"`
+	GroundingSupports            []GroundingSupport       `json:"groundingSupports,omitempty"`
+	RetrievalQueries             []string                 `json:"retrievalQueries,omitempty"`
+	SourceFlaggingURIs           []map[string]interface{} `json:"sourceFlaggingUris,omitempty"`
+	RetrievalMetadata            map[string]interface{}   `json:"retrievalMetadata,omitempty"`
+	GoogleMapsWidgetContextToken string                   `json:"googleMapsWidgetContextToken,omitempty"`
 }
 
 type SearchEntryPoint struct {
 	RenderedContent string `json:"renderedContent,omitempty"`
+	SDKBlob         string `json:"sdkBlob,omitempty"`
 }
 
 type GroundingChunk struct {
-	Web *WebChunk `json:"web,omitempty"`
+	Web              *WebChunk              `json:"web,omitempty"`
+	RetrievedContext map[string]interface{} `json:"retrievedContext,omitempty"`
+	Maps             map[string]interface{} `json:"maps,omitempty"`
 }
 
 type WebChunk struct {
-	URI   string `json:"uri,omitempty"`
-	Title string `json:"title,omitempty"`
+	URI    string `json:"uri,omitempty"`
+	Title  string `json:"title,omitempty"`
+	Domain string `json:"domain,omitempty"`
 }
 
 type GroundingSupport struct {
-	GroundingChunkIndices []int    `json:"groundingChunkIndices,omitempty"`
-	Segment               *Segment `json:"segment,omitempty"`
+	GroundingChunkIndices []int     `json:"groundingChunkIndices,omitempty"`
+	ConfidenceScores      []float64 `json:"confidenceScores,omitempty"`
+	Segment               *Segment  `json:"segment,omitempty"`
 }
 
 type Segment struct {
+	PartIndex  int    `json:"partIndex,omitempty"`
 	StartIndex int    `json:"startIndex,omitempty"`
 	EndIndex   int    `json:"endIndex,omitempty"`
 	Text       string `json:"text,omitempty"`
@@ -105,17 +114,22 @@ type VertexContent struct {
 }
 
 type VertexPart struct {
-	Text             string            `json:"text,omitempty"`
-	InlineData       *InlineData       `json:"inlineData,omitempty"`
-	FunctionCall     *FunctionCall     `json:"functionCall,omitempty"`
-	FunctionResponse *FunctionResponse `json:"functionResponse,omitempty"`
-	Thought          bool              `json:"thought,omitempty"`
-	ThoughtSignature string            `json:"thoughtSignature,omitempty"`
+	Text                string                 `json:"text,omitempty"`
+	InlineData          *InlineData            `json:"inlineData,omitempty"`
+	FileData            map[string]interface{} `json:"fileData,omitempty"`
+	FunctionCall        *FunctionCall          `json:"functionCall,omitempty"`
+	FunctionResponse    *FunctionResponse      `json:"functionResponse,omitempty"`
+	ExecutableCode      map[string]interface{} `json:"executableCode,omitempty"`
+	CodeExecutionResult map[string]interface{} `json:"codeExecutionResult,omitempty"`
+	VideoMetadata       map[string]interface{} `json:"videoMetadata,omitempty"`
+	Thought             bool                   `json:"thought,omitempty"`
+	ThoughtSignature    string                 `json:"thoughtSignature,omitempty"`
 }
 
 type InlineData struct {
-	MimeType string `json:"mimeType"`
-	Data     string `json:"data"`
+	MimeType    string `json:"mimeType"`
+	Data        string `json:"data"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 
 type TextPart struct {
@@ -132,6 +146,7 @@ type FunctionCall struct {
 }
 
 type FunctionResponse struct {
+	ID       string                 `json:"id,omitempty"`
 	Name     string                 `json:"name"`
 	Response map[string]interface{} `json:"response,omitempty"`
 }

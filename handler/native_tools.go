@@ -41,12 +41,18 @@ func nativeGeminiToolFieldName(name string) (string, bool) {
 		return "googleSearch", true
 	case "googleSearchRetrieval":
 		return "googleSearchRetrieval", true
+	case "googleMaps", "google_maps":
+		return "googleMaps", true
 	case "enterpriseWebSearch":
 		return "enterpriseWebSearch", true
+	case "parallelAiSearch", "parallel_ai_search":
+		return "parallelAiSearch", true
 	case "codeExecution", "code_execution", "code_interpreter":
 		return "codeExecution", true
 	case "urlContext", "url_context":
 		return "urlContext", true
+	case "computerUse", "computer_use":
+		return "computerUse", true
 	default:
 		if strings.HasPrefix(name, "web_search") {
 			return "googleSearch", true

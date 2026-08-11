@@ -14,9 +14,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const defaultOpenAIImageModel = "gemini-3-pro-image"
+
 // ImageGenerations handles POST /v1/images/generations.
 func ImageGenerations(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerOpenAIImages))
 		contentType := r.Header.Get("Content-Type")
 
 		var prompt, modelName string
@@ -25,6 +28,7 @@ func ImageGenerations(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Ha
 		var n int
 		var nProvided bool
 		var responseFormat string
+		var size, quality string
 
 		if isMultipart(contentType) {
 			if err := r.ParseMultipartForm(32 << 20); err != nil {
@@ -37,6 +41,8 @@ func ImageGenerations(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Ha
 			prompt = r.FormValue("prompt")
 			modelName = r.FormValue("model")
 			responseFormat = r.FormValue("response_format")
+			size = r.FormValue("size")
+			quality = r.FormValue("quality")
 			if nStr := r.FormValue("n"); nStr != "" {
 				nProvided = true
 				parsed, err := strconv.Atoi(nStr)
@@ -74,6 +80,8 @@ func ImageGenerations(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Ha
 				nProvided = true
 			}
 			responseFormat = req.ResponseFormat
+			size = req.Size
+			quality = req.Quality
 			if req.Image != "" {
 				imageMime, imageB64 = parseDataURL(req.Image)
 			}
@@ -86,7 +94,7 @@ func ImageGenerations(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Ha
 			return
 		}
 		if strings.TrimSpace(modelName) == "" {
-			modelName = "gemini-3-pro-image-preview"
+			modelName = defaultOpenAIImageModel
 		}
 		if message := validateModelName(modelName, allowCustomModelNames); message != "" {
 			writeOpenAIImageValidationError(w, message)
@@ -104,13 +112,14 @@ func ImageGenerations(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Ha
 			return
 		}
 
-		generateImages(w, r, vp, modelName, prompt, imageB64, imageMime, n)
+		generateImages(w, r, vp, modelName, prompt, imageB64, imageMime, n, size, quality)
 	})
 }
 
 // ImageEdits handles POST /v1/images/edits.
 func ImageEdits(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerOpenAIImages))
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
 			WriteJSON(w, http.StatusBadRequest, model.ErrorResponse{
 				Error: &model.APIError{Message: "Invalid multipart form: " + err.Error(), Type: "invalid_request_error"},
@@ -122,6 +131,8 @@ func ImageEdits(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler 
 		modelName := r.FormValue("model")
 		var n int
 		var nProvided bool
+		size := r.FormValue("size")
+		quality := r.FormValue("quality")
 		if nStr := r.FormValue("n"); nStr != "" {
 			nProvided = true
 			parsed, err := strconv.Atoi(nStr)
@@ -139,7 +150,7 @@ func ImageEdits(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler 
 			return
 		}
 		if strings.TrimSpace(modelName) == "" {
-			modelName = "gemini-3-pro-image-preview"
+			modelName = defaultOpenAIImageModel
 		}
 		if message := validateModelName(modelName, allowCustomModelNames); message != "" {
 			writeOpenAIImageValidationError(w, message)
@@ -173,7 +184,7 @@ func ImageEdits(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler 
 		imageB64 := base64.StdEncoding.EncodeToString(data)
 		imageMime := detectMimeType(fileHeader.Header.Get("Content-Type"), fileHeader.Filename)
 
-		generateImages(w, r, vp, modelName, prompt, imageB64, imageMime, n)
+		generateImages(w, r, vp, modelName, prompt, imageB64, imageMime, n, size, quality)
 	})
 }
 
@@ -183,6 +194,7 @@ func generateImages(
 	vp *proxy.VertexProxy,
 	modelName, prompt, imageB64, imageMime string,
 	n int,
+	size, quality string,
 ) {
 	parts := []map[string]interface{}{{"text": prompt}}
 
@@ -204,6 +216,14 @@ func generateImages(
 	genConfig := map[string]interface{}{
 		"responseModalities": []string{"TEXT", "IMAGE"},
 	}
+	if aspectRatio := openAIImageAspectRatio(size); aspectRatio != "" {
+		genConfig["imageConfig"] = map[string]interface{}{"aspectRatio": aspectRatio}
+	} else if strings.TrimSpace(size) != "" && !strings.EqualFold(strings.TrimSpace(size), "auto") {
+		w.Header().Set("X-Vertex2API-Warning", "OpenAI image size has no exact Vertex aspect-ratio equivalent; the model default was used")
+	}
+	if quality != "" && quality != "auto" {
+		w.Header().Add("X-Vertex2API-Warning", "OpenAI image quality has no exact Vertex equivalent; the model default was used")
+	}
 
 	var allImages []model.ImageData
 	for i := 0; i < n; i++ {
@@ -213,8 +233,8 @@ func generateImages(
 				log.Debug().Err(err).Str("model", modelName).Int("n", i+1).Msg("Image generation request canceled")
 				return
 			}
-			log.Error().Str("err", vp.UpstreamLogError(err)).Str("model", modelName).Int("n", i+1).Msg("Image generation failed")
-			WriteJSON(w, http.StatusInternalServerError, publicServerErrorResponse(err))
+			log.Error().Str("err", vp.UpstreamLogError(err)).Str("model", modelName).Int("n", i+1).Msg("OpenAI Images generation failed")
+			WriteJSON(w, http.StatusInternalServerError, publicUpstreamErrorResponse(vp, err))
 			return
 		}
 		for _, img := range result.ImageParts {
@@ -240,6 +260,37 @@ func generateImages(
 		Created: time.Now().Unix(),
 		Data:    allImages,
 	})
+}
+
+func openAIImageAspectRatio(size string) string {
+	size = strings.ToLower(strings.TrimSpace(size))
+	if size == "" || size == "auto" {
+		return ""
+	}
+	parts := strings.SplitN(size, "x", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	width, widthErr := strconv.Atoi(parts[0])
+	height, heightErr := strconv.Atoi(parts[1])
+	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
+		return ""
+	}
+	divisor := greatestCommonDivisor(width, height)
+	ratio := strconv.Itoa(width/divisor) + ":" + strconv.Itoa(height/divisor)
+	switch ratio {
+	case "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9":
+		return ratio
+	default:
+		return ""
+	}
+}
+
+func greatestCommonDivisor(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 func writeOpenAIImageValidationError(w http.ResponseWriter, message string) {

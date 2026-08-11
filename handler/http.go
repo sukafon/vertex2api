@@ -22,6 +22,19 @@ func publicServerErrorResponse(err error) model.ErrorResponse {
 	}
 }
 
+func publicUpstreamErrorMessage(vp *proxy.VertexProxy, err error) string {
+	if vp != nil && vp.RedactUpstreamResponses() {
+		return publicServerErrorMessage
+	}
+	return publicServerErrorMessageFor(err)
+}
+
+func publicUpstreamErrorResponse(vp *proxy.VertexProxy, err error) model.ErrorResponse {
+	return model.ErrorResponse{
+		Error: &model.APIError{Message: publicUpstreamErrorMessage(vp, err), Type: "server_error"},
+	}
+}
+
 func upstreamLogError(vp *proxy.VertexProxy, err error) string {
 	if vp == nil {
 		if err == nil {
@@ -111,9 +124,9 @@ func WriteProtocolError(w http.ResponseWriter, r *http.Request, status int, mess
 	})
 }
 
-func writeUpstreamProtocolError(w http.ResponseWriter, r *http.Request, err error) {
+func writeUpstreamProtocolError(w http.ResponseWriter, r *http.Request, vp *proxy.VertexProxy, err error) {
 	status := proxy.HTTPStatusForError(err)
-	WriteProtocolError(w, r, status, publicServerErrorMessageFor(err), openAIErrorType(status))
+	WriteProtocolError(w, r, status, publicUpstreamErrorMessage(vp, err), openAIErrorType(status))
 }
 
 func openAIErrorType(status int) string {

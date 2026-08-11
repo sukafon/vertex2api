@@ -62,6 +62,7 @@ func run() error {
 		Int("write_timeout_seconds", cfg.WriteTimeoutSeconds).
 		Bool("auto_fetch_models", cfg.AutoFetchModels).
 		Bool("allow_custom_model_names", cfg.AllowCustomModelNames).
+		Bool("redact_upstream_responses", cfg.RedactUpstreamResponses).
 		Msg("Configuration loaded")
 
 	httpClient, err := client.New(cfg)

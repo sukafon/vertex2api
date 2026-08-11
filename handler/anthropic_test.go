@@ -434,6 +434,94 @@ func TestStreamAnthropicResponseHandlesCumulativeTextChunks(t *testing.T) {
 	}
 }
 
+func TestStreamAnthropicResponseEmitsDetachedVertexThoughtSignatureBeforeStop(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	rec := httptest.NewRecorder()
+
+	streamAnthropicResponse(rec, req, model.AnthropicMessageRequest{Model: "gemini-test"}, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
+		if err := onChunk(&proxy.CallResult{Parts: []model.VertexPart{{Text: "planning", Thought: true}}}); err != nil {
+			return err
+		}
+		return onChunk(&proxy.CallResult{
+			Parts:        []model.VertexPart{{Thought: true, ThoughtSignature: "vertex-signature"}},
+			FinishReason: "STOP",
+		})
+	})
+
+	body := rec.Body.String()
+	signature := strings.Index(body, `"signature":"vertex-signature"`)
+	blockStop := strings.Index(body, "event: content_block_stop\n")
+	messageDelta := strings.Index(body, "event: message_delta\n")
+	messageStop := strings.Index(body, "event: message_stop\n")
+	if signature < 0 || blockStop < signature || messageDelta < blockStop || messageStop < messageDelta {
+		t.Fatalf("invalid thinking termination order:\n%s", body)
+	}
+	if got := strings.Count(body, "event: content_block_start\n"); got != 1 {
+		t.Fatalf("thinking block starts = %d, want 1:\n%s", got, body)
+	}
+}
+
+func TestBuildAnthropicContentMergesDetachedThoughtSignature(t *testing.T) {
+	content := buildAnthropicContent(&proxy.CallResult{Parts: []model.VertexPart{
+		{Text: "planning", Thought: true},
+		{Thought: true, ThoughtSignature: "vertex-signature"},
+	}})
+	if len(content) != 1 || content[0]["type"] != "thinking" || content[0]["signature"] != "vertex-signature" {
+		t.Fatalf("content = %#v", content)
+	}
+}
+
+func TestStreamAnthropicResponseKeepsCompletedResponseAsEndTurnWithPromptFeedback(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	rec := httptest.NewRecorder()
+
+	streamAnthropicResponse(rec, req, model.AnthropicMessageRequest{Model: "gemini-test"}, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
+		if err := onChunk(&proxy.CallResult{Parts: []model.VertexPart{{Text: "completed response"}}}); err != nil {
+			return err
+		}
+		return onChunk(&proxy.CallResult{
+			FinishReason:   "STOP",
+			PromptFeedback: map[string]interface{}{"safetyRatings": []interface{}{}},
+		})
+	})
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"text":"completed response"`) {
+		t.Fatalf("completed response missing:\n%s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("final stop reason is not end_turn:\n%s", body)
+	}
+	if strings.Contains(body, `"stop_reason":"refusal"`) || strings.Contains(body, "event: ping\n") {
+		t.Fatalf("completed third-party response was rewritten as refusal or heartbeat:\n%s", body)
+	}
+	if got := strings.Count(body, "event: message_stop\n"); got != 1 {
+		t.Fatalf("message_stop events = %d, want 1:\n%s", got, body)
+	}
+}
+
+func TestStreamAnthropicResponsePreservesToolUseAcrossTrailingFinishChunk(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	rec := httptest.NewRecorder()
+
+	streamAnthropicResponse(rec, req, model.AnthropicMessageRequest{Model: "gemini-test"}, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
+		if err := onChunk(&proxy.CallResult{Parts: []model.VertexPart{{
+			FunctionCall: &model.FunctionCall{Name: "lookup", Args: map[string]interface{}{"query": "weather"}},
+		}}}); err != nil {
+			return err
+		}
+		return onChunk(&proxy.CallResult{FinishReason: "STOP"})
+	})
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"stop_reason":"tool_use"`) {
+		t.Fatalf("trailing finish chunk overwrote tool_use:\n%s", body)
+	}
+	if strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("tool call was incorrectly finalized as end_turn:\n%s", body)
+	}
+}
+
 func TestAnthropicTextDelta(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -607,14 +695,14 @@ func TestBuildAnthropicContentGeneratesUniqueToolIDs(t *testing.T) {
 	}
 }
 
-func TestBuildAnthropicContentUsesOfficialImageBlock(t *testing.T) {
+func TestBuildAnthropicContentDegradesGeneratedImageToStandardTextBlock(t *testing.T) {
 	content := buildAnthropicContent(&proxy.CallResult{ImageParts: []model.InlineData{{MimeType: "image/png", Data: "aGVsbG8="}}})
-	if len(content) != 1 || content[0]["type"] != "image" {
-		t.Fatalf("content = %v, want image block", content)
+	if len(content) != 1 || content[0]["type"] != "text" {
+		t.Fatalf("content = %v, want text block", content)
 	}
-	source := content[0]["source"].(map[string]interface{})
-	if source["type"] != "base64" || source["media_type"] != "image/png" || source["data"] != "aGVsbG8=" {
-		t.Fatalf("image source = %v", source)
+	text, _ := content[0]["text"].(string)
+	if !strings.Contains(text, "data:image/png;base64,aGVsbG8=") {
+		t.Fatalf("image text = %q", text)
 	}
 }
 
@@ -693,5 +781,75 @@ func TestValidateAnthropicRequestAcceptsSystemMessage(t *testing.T) {
 	}
 	if systemInstruction == nil || !strings.Contains(fmt.Sprintf("%v", systemInstruction), "You are helpful.") {
 		t.Fatalf("system message was not preserved in system instruction: %#v", systemInstruction)
+	}
+}
+
+func TestValidateAnthropicRequestRejectsUnknownNamelessToolInsteadOfDroppingIt(t *testing.T) {
+	maxTokens := 32
+	req := model.AnthropicMessageRequest{
+		Model: "gemini-test", MaxTokens: &maxTokens,
+		Messages: []model.AnthropicInputMessage{{Role: "user", Content: "hello"}},
+		Tools:    []map[string]interface{}{{"type": "unknown_server_tool"}},
+	}
+	if got := validateAnthropicRequest(req); !strings.Contains(got, "no Vertex equivalent") {
+		t.Fatalf("validation = %q", got)
+	}
+}
+
+func TestAnthropicStructuredOutputMapsToVertexJSONSchema(t *testing.T) {
+	maxTokens := 64
+	req := model.AnthropicMessageRequest{
+		Model: "gemini-test", MaxTokens: &maxTokens,
+		Messages: []model.AnthropicInputMessage{{Role: "user", Content: "extract"}},
+		OutputConfig: map[string]interface{}{"format": map[string]interface{}{
+			"type": "json_schema", "schema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"name": map[string]interface{}{"type": "string"}}},
+		}},
+	}
+	if got := validateAnthropicRequest(req); got != "" {
+		t.Fatalf("structured output rejected: %s", got)
+	}
+	config := buildAnthropicGenerationConfig(req)
+	if config["responseMimeType"] != "application/json" || config["responseJsonSchema"] == nil {
+		t.Fatalf("generation config = %#v", config)
+	}
+}
+
+func TestAnthropicOutputEffortMapsToVertexThinking(t *testing.T) {
+	maxTokens := 64
+	req := model.AnthropicMessageRequest{
+		Model: "gemini-3.6-flash", MaxTokens: &maxTokens,
+		Messages:     []model.AnthropicInputMessage{{Role: "user", Content: "think"}},
+		OutputConfig: map[string]interface{}{"effort": "max"},
+	}
+	if got := validateAnthropicRequest(req); got != "" {
+		t.Fatalf("output effort rejected: %s", got)
+	}
+	thinking := buildAnthropicGenerationConfig(req)["thinkingConfig"].(map[string]interface{})
+	if thinking["thinkingLevel"] != "HIGH" || thinking["includeThoughts"] != true {
+		t.Fatalf("thinking config = %#v", thinking)
+	}
+}
+
+func TestAnthropicDocumentsAndRemoteImagesMapToVertexMedia(t *testing.T) {
+	content := []interface{}{
+		map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "url", "url": "https://example.com/a.png", "media_type": "image/png"}},
+		map[string]interface{}{"type": "document", "source": map[string]interface{}{"type": "base64", "media_type": "application/pdf", "data": "cGRm"}},
+		map[string]interface{}{"type": "document", "title": "Notes", "source": map[string]interface{}{"type": "text", "data": "hello"}},
+	}
+	parts := convertAnthropicContentToParts("gemini-test", content, "user", map[string]string{}, "")
+	if len(parts) != 3 || parts[0]["fileData"] == nil || parts[1]["inlineData"] == nil || !strings.Contains(fmt.Sprintf("%v", parts[2]["text"]), "Notes") {
+		t.Fatalf("document/image conversion = %#v", parts)
+	}
+}
+
+func TestBuildAnthropicContentPreservesMixedPartOrder(t *testing.T) {
+	content := buildAnthropicContent(&proxy.CallResult{Parts: []model.VertexPart{
+		{Text: "think", Thought: true, ThoughtSignature: "sig"},
+		{Text: "before"},
+		{FunctionCall: &model.FunctionCall{ID: "c1", Name: "lookup", Args: map[string]interface{}{"q": "x"}}},
+		{Text: "after"},
+	}})
+	if len(content) != 4 || content[0]["type"] != "thinking" || content[1]["text"] != "before" || content[2]["type"] != "tool_use" || content[3]["text"] != "after" {
+		t.Fatalf("content order = %#v", content)
 	}
 }

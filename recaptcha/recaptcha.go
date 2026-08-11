@@ -79,25 +79,23 @@ func (tl *TokenLease) Retire() {
 
 // TokenCache 管理 recaptcha token 的获取与缓存
 type TokenCache struct {
-	mu                 sync.Mutex
-	tokens             map[string]*cachedToken
-	httpClient         *client.HTTPClient
-	baseURL            string
-	prefixBaseURLs     []string
-	recaptchaKey       string
-	redactUpstreamLogs bool
-	randomFingerprint  bool
+	mu                sync.Mutex
+	tokens            map[string]*cachedToken
+	httpClient        *client.HTTPClient
+	baseURL           string
+	prefixBaseURLs    []string
+	recaptchaKey      string
+	randomFingerprint bool
 }
 
 func NewTokenCache(httpClient *client.HTTPClient, cfg *config.Config) *TokenCache {
 	return &TokenCache{
-		httpClient:         httpClient,
-		baseURL:            cfg.RecaptchaBase,
-		prefixBaseURLs:     cfg.PrefixRecaptchaBaseURLs,
-		recaptchaKey:       cfg.RecaptchaKey,
-		redactUpstreamLogs: cfg.RedactUpstreamLogs,
-		randomFingerprint:  cfg.RandomFingerprint,
-		tokens:             make(map[string]*cachedToken),
+		httpClient:        httpClient,
+		baseURL:           cfg.RecaptchaBase,
+		prefixBaseURLs:    cfg.PrefixRecaptchaBaseURLs,
+		recaptchaKey:      cfg.RecaptchaKey,
+		randomFingerprint: cfg.RandomFingerprint,
+		tokens:            make(map[string]*cachedToken),
 	}
 }
 
@@ -219,7 +217,7 @@ func (tc *TokenCache) fetchWithRetry(ctx context.Context, maxRetry int) (string,
 			return token, baseURL, nil
 		}
 		lastErr = err
-		log.Warn().Str("err", config.UpstreamLogError(err, tc.redactUpstreamLogs, 120)).Int("attempt", i+1).Msg("Failed to get recaptcha token, retrying...")
+		log.Warn().Str("err", config.UpstreamLogError(err, false, 120)).Int("attempt", i+1).Msg("Failed to get recaptcha token, retrying...")
 	}
 	return "", "", fmt.Errorf("failed to get recaptcha token after %d attempts: %w", maxRetry, lastErr)
 }

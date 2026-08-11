@@ -41,7 +41,8 @@ type Config struct {
 	WriteTimeoutSeconds     int
 	AutoFetchModels         bool
 	AutoFetchCron           string
-	RedactUpstreamLogs      bool
+	RedactUpstreamResponses bool
+	LogCode3RequestBodies   bool
 	RandomFingerprint       bool
 	TLSClientProfile        string
 	CORSAllowOrigin         string
@@ -76,7 +77,8 @@ func Load() *Config {
 		WriteTimeoutSeconds:     getEnvInt("WRITE_TIMEOUT_SECONDS", 600),
 		AutoFetchModels:         getEnvBool("AUTO_FETCH_MODELS", true),
 		AutoFetchCron:           getEnv("AUTO_FETCH_CRON", "0 0,4 * * *"),
-		RedactUpstreamLogs:      getEnvBool("REDACT_UPSTREAM_LOGS", false),
+		RedactUpstreamResponses: getEnvBool("REDACT_UPSTREAM_RESPONSES", false),
+		LogCode3RequestBodies:   getEnvBool("LOG_CODE3_REQUEST_BODIES", false),
 		RandomFingerprint:       getEnvBool("RANDOM_FINGERPRINT", false),
 		TLSClientProfile:        getEnv("TLS_CLIENT_PROFILE", "chrome_146"),
 		CORSAllowOrigin:         strings.TrimSpace(getEnv("CORS_ALLOW_ORIGIN", "")),

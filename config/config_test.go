@@ -55,9 +55,10 @@ func TestUpstreamLogValueHonorsRedactionAndTruncation(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
+func TestLoadDefaultsAutoFetchModelsAndUpstreamResponseRedaction(t *testing.T) {
 	t.Setenv("AUTO_FETCH_MODELS", "")
-	t.Setenv("REDACT_UPSTREAM_LOGS", "")
+	t.Setenv("REDACT_UPSTREAM_RESPONSES", "")
+	t.Setenv("LOG_CODE3_REQUEST_BODIES", "")
 	t.Setenv("RANDOM_FINGERPRINT", "")
 	t.Setenv("TLS_CLIENT_PROFILE", "")
 	t.Setenv("ALLOW_CUSTOM_MODEL_NAMES", "")
@@ -66,8 +67,11 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 	if !cfg.AutoFetchModels {
 		t.Fatal("AUTO_FETCH_MODELS default = false, want true")
 	}
-	if cfg.RedactUpstreamLogs {
-		t.Fatal("REDACT_UPSTREAM_LOGS default = true, want false")
+	if cfg.RedactUpstreamResponses {
+		t.Fatal("REDACT_UPSTREAM_RESPONSES default = true, want false")
+	}
+	if cfg.LogCode3RequestBodies {
+		t.Fatal("LOG_CODE3_REQUEST_BODIES default = true, want false")
 	}
 	if cfg.RandomFingerprint {
 		t.Fatal("RANDOM_FINGERPRINT default = true, want false")
@@ -77,6 +81,20 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamLogRedaction(t *testing.T) {
 	}
 	if cfg.AllowCustomModelNames {
 		t.Fatal("ALLOW_CUSTOM_MODEL_NAMES default = true, want false")
+	}
+}
+
+func TestLoadCanEnableUpstreamResponseRedaction(t *testing.T) {
+	t.Setenv("REDACT_UPSTREAM_RESPONSES", "true")
+	if cfg := Load(); !cfg.RedactUpstreamResponses {
+		t.Fatal("REDACT_UPSTREAM_RESPONSES=true did not enable response redaction")
+	}
+}
+
+func TestLoadCanEnableCode3RequestBodyLogging(t *testing.T) {
+	t.Setenv("LOG_CODE3_REQUEST_BODIES", "true")
+	if cfg := Load(); !cfg.LogCode3RequestBodies {
+		t.Fatal("LOG_CODE3_REQUEST_BODIES = false, want true")
 	}
 }
 

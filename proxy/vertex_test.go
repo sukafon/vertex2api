@@ -70,15 +70,13 @@ func TestBuildVertexAPIURL(t *testing.T) {
 	}
 }
 
-func TestUpstreamLogErrorHonorsConfig(t *testing.T) {
-	redacted := &VertexProxy{cfg: &config.Config{RedactUpstreamLogs: true}}
-	if got := redacted.upstreamLogError(errors.New("upstream secret")); got != "[REDACTED]" {
-		t.Fatalf("redacted upstream error = %q", got)
+func TestUpstreamLogErrorStaysVisibleWhenResponsesAreRedacted(t *testing.T) {
+	vp := &VertexProxy{cfg: &config.Config{RedactUpstreamResponses: true}}
+	if got := vp.upstreamLogError(errors.New("upstream secret")); got != "upstream secret" {
+		t.Fatalf("upstream log error = %q, want diagnostic detail", got)
 	}
-
-	unredacted := &VertexProxy{cfg: &config.Config{RedactUpstreamLogs: false}}
-	if got := unredacted.upstreamLogError(errors.New("upstream detail")); got != "upstream detail" {
-		t.Fatalf("unredacted upstream error = %q", got)
+	if !vp.RedactUpstreamResponses() {
+		t.Fatal("RedactUpstreamResponses() = false, want true")
 	}
 }
 
@@ -105,7 +103,7 @@ func TestCallDoesNotRetryVertexNotFoundError(t *testing.T) {
 		t.Fatalf("BuildVertexBody returned error: %v", err)
 	}
 
-	result, err := vp.CallContext(context.Background(), bodyJSON)
+	result, err := vp.CallRequireAssistantOutputContext(context.Background(), bodyJSON)
 	if err == nil {
 		t.Fatal("Call returned nil error, want vertex not found error")
 	}
@@ -169,6 +167,172 @@ func TestStreamDoesNotRetryVertexNotFoundError(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("vertex requests = %d, want 1", requests)
+	}
+}
+
+func TestCallRetriesResponseWithoutAssistantOutput(t *testing.T) {
+	requests := 0
+	vertexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			_, _ = w.Write([]byte(`[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":null}}]}}]}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"recovered"}]}}]}}]}]`))
+	}))
+	defer vertexServer.Close()
+
+	vp := NewVertexProxy(&client.HTTPClient{HTTP: vertexServer.Client()}, nil, &config.Config{
+		VertexBaseURL: vertexServer.URL,
+		MaxRetry:      1,
+		RetryDelayMs:  0,
+	})
+	bodyJSON, err := BuildVertexBody("gemini-test", []map[string]interface{}{
+		{"role": "user", "parts": []map[string]interface{}{{"text": "hello"}}},
+	}, nil, nil, nil, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := vp.CallRequireAssistantOutputContext(context.Background(), bodyJSON)
+	if err != nil {
+		t.Fatalf("CallContext returned error: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("vertex requests = %d, want 2", requests)
+	}
+	if got := result.TextParts[0].Text; got != "recovered" {
+		t.Fatalf("response text = %q, want recovered", got)
+	}
+}
+
+func TestCallRequireAssistantOutputDoesNotTreatPromptFeedbackAsOutput(t *testing.T) {
+	requests := 0
+	vertexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			_, _ = w.Write([]byte(`[{"results":[{"data":{"promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"blocked"},"usageMetadata":{"promptTokenCount":2}}}]}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"recovered"}]}}]}}]}]`))
+	}))
+	defer vertexServer.Close()
+
+	vp := NewVertexProxy(&client.HTTPClient{HTTP: vertexServer.Client()}, nil, &config.Config{
+		VertexBaseURL: vertexServer.URL, MaxRetry: 2,
+	})
+	bodyJSON, err := BuildVertexBody("gemini-test", []map[string]interface{}{
+		{"role": "user", "parts": []map[string]interface{}{{"text": "hello"}}},
+	}, nil, nil, nil, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := vp.CallRequireAssistantOutputContext(context.Background(), bodyJSON)
+	if err != nil {
+		t.Fatalf("CallContext returned error: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("vertex requests = %d, want 2", requests)
+	}
+	if got := result.TextParts[0].Text; got != "recovered" {
+		t.Fatalf("response text = %q, want recovered", got)
+	}
+}
+
+func TestParseVertexResponsePreservesOrderedPartUnion(t *testing.T) {
+	body := []byte(`[{"results":[{"data":{"candidates":[{"content":{"role":"model","parts":[` +
+		`{"text":"thinking","thought":true,"thoughtSignature":"c2ln"},` +
+		`{"executableCode":{"language":"PYTHON","code":"print(1)"}},` +
+		`{"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"1"}},` +
+		`{"inlineData":{"mimeType":"image/png","data":"aW1n"},"thoughtSignature":"aW1nc2ln"},` +
+		`{"fileData":{"mimeType":"application/pdf","fileUri":"gs://bucket/a.pdf"}},` +
+		`{"functionCall":{"id":"call-1","name":"lookup","args":{"q":"x"}},"thoughtSignature":"Y2FsbHNpZw=="},` +
+		`{"functionResponse":{"id":"call-1","name":"lookup","response":{"ok":true}}}` +
+		`]}}]}}]}]`)
+	result, status, err := parseVertexResponse(body)
+	if err != nil || status != 0 {
+		t.Fatalf("parseVertexResponse status=%d err=%v", status, err)
+	}
+	if len(result.Parts) != 7 || len(result.Candidates) != 1 || len(result.Candidates[0].Parts) != 7 {
+		t.Fatalf("ordered parts were not preserved: top=%d candidates=%+v", len(result.Parts), result.Candidates)
+	}
+	if result.Parts[0].Text != "thinking" || len(result.Parts[1].ExecutableCode) == 0 || len(result.Parts[2].CodeExecutionResult) == 0 || result.Parts[3].InlineData == nil || len(result.Parts[4].FileData) == 0 || result.Parts[5].FunctionCall == nil || result.Parts[6].FunctionResponse == nil {
+		t.Fatalf("part union/order mismatch: %#v", result.Parts)
+	}
+	if result.Parts[6].FunctionResponse.ID != "call-1" {
+		t.Fatalf("function response id = %q", result.Parts[6].FunctionResponse.ID)
+	}
+}
+
+func TestStreamRetriesResponseWithoutAssistantOutput(t *testing.T) {
+	requests := 0
+	vertexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			_, _ = w.Write([]byte(`[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":null}}],"usageMetadata":{"promptTokenCount":1}}}]}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"recovered"}]}}]}}]}]`))
+	}))
+	defer vertexServer.Close()
+
+	vp := NewVertexProxy(&client.HTTPClient{HTTP: vertexServer.Client()}, nil, &config.Config{
+		VertexBaseURL: vertexServer.URL,
+		MaxRetry:      1,
+		RetryDelayMs:  0,
+	})
+	bodyJSON, err := BuildVertexBody("gemini-test", []map[string]interface{}{
+		{"role": "user", "parts": []map[string]interface{}{{"text": "hello"}}},
+	}, nil, nil, nil, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var chunks []*CallResult
+	err = vp.StreamRequireAssistantOutputContext(context.Background(), bodyJSON, func(result *CallResult) error {
+		chunks = append(chunks, result)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamContext returned error: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("vertex requests = %d, want 2", requests)
+	}
+	if len(chunks) != 2 || len(chunks[0].TextParts) != 1 || chunks[0].TextParts[0].Text != "recovered" || chunks[1].FinishReason != "STOP" {
+		t.Fatalf("stream chunks = %+v, want recovered output followed by the EOF finish metadata", chunks)
+	}
+}
+
+func TestStreamReturnsErrorAfterResponsesWithoutAssistantOutput(t *testing.T) {
+	requests := 0
+	vertexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":null}}]}}]}]`))
+	}))
+	defer vertexServer.Close()
+
+	vp := NewVertexProxy(&client.HTTPClient{HTTP: vertexServer.Client()}, nil, &config.Config{
+		VertexBaseURL: vertexServer.URL,
+		MaxRetry:      1,
+		RetryDelayMs:  0,
+	})
+	bodyJSON, err := BuildVertexBody("gemini-test", []map[string]interface{}{
+		{"role": "user", "parts": []map[string]interface{}{{"text": "hello"}}},
+	}, nil, nil, nil, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = vp.StreamRequireAssistantOutputContext(context.Background(), bodyJSON, func(_ *CallResult) error {
+		t.Fatal("finish-only attempts must not be emitted")
+		return nil
+	})
+	if !errors.Is(err, ErrNoAssistantOutput) {
+		t.Fatalf("StreamContext error = %v, want ErrNoAssistantOutput", err)
+	}
+	if requests != 2 {
+		t.Fatalf("vertex requests = %d, want 2", requests)
 	}
 }
 
@@ -887,6 +1051,260 @@ func TestBuildVertexBodyPassesToolsAndToolConfigTopLevel(t *testing.T) {
 	}
 }
 
+func TestNormalizeContentsDropsUnansweredParallelFunctionCall(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "model",
+			"parts": []map[string]interface{}{
+				{"functionCall": map[string]interface{}{"name": "terminal", "args": map[string]interface{}{"command": "test"}}},
+				{"functionCall": map[string]interface{}{"name": "search_files", "args": map[string]interface{}{"pattern": "x"}}},
+			},
+		},
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{"functionResponse": map[string]interface{}{"name": "search_files", "response": map[string]interface{}{"output": "found"}}},
+			},
+		},
+	}
+
+	normalized, err := normalizeContents("gemini-3.5-flash", contents)
+	if err != nil {
+		t.Fatalf("normalizeContents() error = %v", err)
+	}
+	if len(normalized) != 2 {
+		t.Fatalf("turn count = %d, want 2: %#v", len(normalized), normalized)
+	}
+	modelParts, _ := toInterfaceSlice(normalized[0]["parts"])
+	responseParts, _ := toInterfaceSlice(normalized[1]["parts"])
+	if len(modelParts) != 1 || len(responseParts) != 1 {
+		t.Fatalf("parts after repair: model=%#v response=%#v", modelParts, responseParts)
+	}
+	call, _ := modelParts[0].(map[string]interface{})["functionCall"].(map[string]interface{})
+	response, _ := responseParts[0].(map[string]interface{})["functionResponse"].(map[string]interface{})
+	if call["name"] != "search_files" || response["name"] != "search_files" {
+		t.Fatalf("wrong pair preserved: call=%#v response=%#v", call, response)
+	}
+}
+
+func TestNormalizeContentsOrdersParallelResponsesByFunctionCall(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "model",
+			"parts": []map[string]interface{}{
+				{"functionCall": map[string]interface{}{"id": "call-1", "name": "first", "args": map[string]interface{}{}}},
+				{"functionCall": map[string]interface{}{"id": "call-2", "name": "second", "args": map[string]interface{}{}}},
+			},
+		},
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{"functionResponse": map[string]interface{}{"id": "call-2", "name": "second", "response": map[string]interface{}{"ok": true}}},
+				{"functionResponse": map[string]interface{}{"id": "call-1", "name": "first", "response": map[string]interface{}{"ok": true}}},
+			},
+		},
+	}
+
+	normalized, err := normalizeContents("gemini-3.5-flash", contents)
+	if err != nil {
+		t.Fatalf("normalizeContents() error = %v", err)
+	}
+	responses, _ := toInterfaceSlice(normalized[1]["parts"])
+	if len(responses) != 2 {
+		t.Fatalf("response count = %d, want 2", len(responses))
+	}
+	first, _ := responses[0].(map[string]interface{})["functionResponse"].(map[string]interface{})
+	second, _ := responses[1].(map[string]interface{})["functionResponse"].(map[string]interface{})
+	if first["id"] != "call-1" || second["id"] != "call-2" {
+		t.Fatalf("responses not ordered by calls: %#v", responses)
+	}
+}
+
+func TestNormalizeContentsAddsGemini36FunctionCallIDs(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "model",
+			"parts": []map[string]interface{}{
+				{"functionCall": map[string]interface{}{"name": "search_files", "args": map[string]interface{}{"pattern": "*.go"}}},
+			},
+		},
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{"functionResponse": map[string]interface{}{"name": "search_files", "response": map[string]interface{}{"output": "found"}}},
+				{"text": "new user message"},
+			},
+		},
+	}
+
+	normalized, err := normalizeContents("gemini-3.6-flash", contents)
+	if err != nil {
+		t.Fatalf("normalizeContents() error = %v", err)
+	}
+	modelParts, _ := toInterfaceSlice(normalized[0]["parts"])
+	responseParts, _ := toInterfaceSlice(normalized[1]["parts"])
+	call, _ := modelParts[0].(map[string]interface{})["functionCall"].(map[string]interface{})
+	response, _ := responseParts[0].(map[string]interface{})["functionResponse"].(map[string]interface{})
+	callID, _ := call["id"].(string)
+	if callID == "" || response["id"] != callID {
+		t.Fatalf("function call IDs were not paired: call=%#v response=%#v", call, response)
+	}
+	if normalized[len(normalized)-1]["role"] != "user" || contentTurnText(normalized[len(normalized)-1]) != "new user message" {
+		t.Fatalf("final user turn was not preserved: %#v", normalized)
+	}
+}
+
+func TestNormalizeContentsPreservesExistingGemini36FunctionCallID(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "model",
+			"parts": []map[string]interface{}{
+				{"functionCall": map[string]interface{}{"id": "client-call-1", "name": "read_file", "args": map[string]interface{}{}}},
+			},
+		},
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{"functionResponse": map[string]interface{}{"name": "read_file", "response": map[string]interface{}{"output": "ok"}}},
+			},
+		},
+	}
+
+	normalized, err := normalizeContents("gemini-3.6-flash", contents)
+	if err != nil {
+		t.Fatalf("normalizeContents() error = %v", err)
+	}
+	modelParts, _ := toInterfaceSlice(normalized[0]["parts"])
+	responseParts, _ := toInterfaceSlice(normalized[1]["parts"])
+	call, _ := modelParts[0].(map[string]interface{})["functionCall"].(map[string]interface{})
+	response, _ := responseParts[0].(map[string]interface{})["functionResponse"].(map[string]interface{})
+	if call["id"] != "client-call-1" || response["id"] != "client-call-1" {
+		t.Fatalf("existing function call ID was not preserved: call=%#v response=%#v", call, response)
+	}
+}
+
+func TestNormalizeContentsDoesNotAddFunctionCallIDsToOlderModels(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "model",
+			"parts": []map[string]interface{}{
+				{"functionCall": map[string]interface{}{"name": "read_file", "args": map[string]interface{}{}}},
+			},
+		},
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{"functionResponse": map[string]interface{}{"name": "read_file", "response": map[string]interface{}{"output": "ok"}}},
+			},
+		},
+	}
+
+	normalized, err := normalizeContents("gemini-3.5-flash", contents)
+	if err != nil {
+		t.Fatalf("normalizeContents() error = %v", err)
+	}
+	modelParts, _ := toInterfaceSlice(normalized[0]["parts"])
+	responseParts, _ := toInterfaceSlice(normalized[1]["parts"])
+	call, _ := modelParts[0].(map[string]interface{})["functionCall"].(map[string]interface{})
+	response, _ := responseParts[0].(map[string]interface{})["functionResponse"].(map[string]interface{})
+	if _, ok := call["id"]; ok {
+		t.Fatalf("older model function call unexpectedly gained an ID: %#v", call)
+	}
+	if _, ok := response["id"]; ok {
+		t.Fatalf("older model function response unexpectedly gained an ID: %#v", response)
+	}
+}
+
+func TestNormalizeContentsRemovesOrphanFunctionResponseWithoutDroppingText(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "model",
+			"parts": []map[string]interface{}{
+				{"text": "partial"},
+				{"functionCall": map[string]interface{}{"name": "missing", "args": map[string]interface{}{}}},
+			},
+		},
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{"text": "continue"},
+				{"functionResponse": map[string]interface{}{"name": "other", "response": map[string]interface{}{"ok": true}}},
+			},
+		},
+	}
+
+	normalized, err := normalizeContents("gemini-3.5-flash", contents)
+	if err != nil {
+		t.Fatalf("normalizeContents() error = %v", err)
+	}
+	if len(normalized) != 2 || contentTurnText(normalized[0]) != "partial" || contentTurnText(normalized[1]) != "continue" {
+		t.Fatalf("text turns were not preserved: %#v", normalized)
+	}
+	for _, turn := range normalized {
+		parts, _ := toInterfaceSlice(turn["parts"])
+		if len(collectFunctionHistoryParts(parts, "functionCall")) != 0 || len(collectFunctionHistoryParts(parts, "functionResponse")) != 0 {
+			t.Fatalf("orphan function part remains: %#v", normalized)
+		}
+	}
+}
+
+func TestBuildVertexBodyPassesNativeAdditionalVariables(t *testing.T) {
+	contents := []map[string]interface{}{{"role": "user", "parts": []map[string]interface{}{{"text": "Hello"}}}}
+	body, err := BuildVertexBodyWithOptions("gemini-test", contents, nil, nil, nil, "token", &VertexRequestOptions{
+		AdditionalVariables: map[string]interface{}{
+			"cachedContent":    "projects/p/locations/global/cachedContents/c1",
+			"labels":           map[string]interface{}{"tenant": "test"},
+			"modelArmorConfig": map[string]interface{}{"promptTemplateName": "armor"},
+			"model":            "must-not-override",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	variables := variablesFromBody(t, body)
+	if variables["cachedContent"] == nil || variables["labels"] == nil {
+		t.Fatalf("native variables = %#v", variables)
+	}
+	if variables["modelArmorConfig"] == nil || variables["safetySettings"] != nil {
+		t.Fatalf("model armor/default safety conversion = %#v", variables)
+	}
+	if variables["model"] != "gemini-test" {
+		t.Fatalf("reserved model was overridden: %#v", variables["model"])
+	}
+}
+
+func TestBuildVertexBodyRejectsModelArmorWithSafetySettings(t *testing.T) {
+	contents := []map[string]interface{}{{"role": "user", "parts": []map[string]interface{}{{"text": "Hello"}}}}
+	_, err := BuildVertexBodyWithOptions("gemini-test", contents, nil, []map[string]string{{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"}}, nil, "token", &VertexRequestOptions{
+		AdditionalVariables: map[string]interface{}{"modelArmorConfig": map[string]interface{}{}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestBuildVertexBodyPreservesCurrentNativeToolKinds(t *testing.T) {
+	contents := []map[string]interface{}{{"role": "user", "parts": []map[string]interface{}{{"text": "Hello"}}}}
+	tools := []interface{}{
+		map[string]interface{}{"googleMaps": map[string]interface{}{}},
+		map[string]interface{}{"parallelAiSearch": map[string]interface{}{}},
+		map[string]interface{}{"computerUse": map[string]interface{}{"environment": "ENVIRONMENT_BROWSER"}},
+	}
+	body, err := BuildVertexBodyWithOptions("gemini-test", contents, nil, nil, nil, "token", &VertexRequestOptions{Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := variablesFromBody(t, body)["tools"].([]interface{})
+	if len(normalized) != 3 {
+		t.Fatalf("native tools = %#v", normalized)
+	}
+	for index, key := range []string{"googleMaps", "parallelAiSearch", "computerUse"} {
+		if normalized[index].(map[string]interface{})[key] == nil {
+			t.Fatalf("native tool %q was dropped: %#v", key, normalized)
+		}
+	}
+}
+
 func TestBuildVertexBodyNormalizesArraySchemaItemsToObject(t *testing.T) {
 	contents := []map[string]interface{}{
 		{
@@ -1040,8 +1458,8 @@ func TestStreamVertexResponseEmitsArrayChunks(t *testing.T) {
 	if status != 0 {
 		t.Fatalf("status = %d, want 0", status)
 	}
-	if len(chunks) != 2 {
-		t.Fatalf("chunks length = %d, want 2", len(chunks))
+	if len(chunks) != 3 {
+		t.Fatalf("chunks length = %d, want 3", len(chunks))
 	}
 	if got := chunks[0].TextParts[0].Text; got != "hello " {
 		t.Fatalf("first chunk text = %q, want hello", got)
@@ -1049,8 +1467,64 @@ func TestStreamVertexResponseEmitsArrayChunks(t *testing.T) {
 	if got := chunks[1].TextParts[0].Text; got != "world" {
 		t.Fatalf("second chunk text = %q, want world", got)
 	}
-	if got := chunks[1].FinishReason; got != "STOP" {
-		t.Fatalf("second chunk finishReason = %q, want STOP", got)
+	if got := chunks[1].FinishReason; got != "" {
+		t.Fatalf("content chunk finishReason = %q, want empty", got)
+	}
+	if got := chunks[2].FinishReason; got != "STOP" {
+		t.Fatalf("final chunk finishReason = %q, want STOP", got)
+	}
+}
+
+func TestStreamVertexResponseDoesNotTreatEarlyStopAsStreamEnd(t *testing.T) {
+	body := `[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"first"}]}}]}},{"data":{"candidates":[{"content":{"role":"model","parts":[{"text":" second"}]}}]}}]}]`
+
+	var chunks []CallResult
+	status, err := streamVertexResponse(strings.NewReader(body), func(result *CallResult) error {
+		chunks = append(chunks, *result)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("streamVertexResponse returned error: %v", err)
+	}
+	if status != 0 {
+		t.Fatalf("status = %d, want 0", status)
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("chunks length = %d, want 3", len(chunks))
+	}
+	if got := chunks[0].TextParts[0].Text; got != "first" {
+		t.Fatalf("first chunk text = %q, want first", got)
+	}
+	if got := chunks[1].TextParts[0].Text; got != " second" {
+		t.Fatalf("second chunk text = %q, want second", got)
+	}
+	if chunks[0].FinishReason != "" || chunks[1].FinishReason != "" {
+		t.Fatalf("content chunks must not carry an early finishReason: %#v", chunks)
+	}
+	if got := chunks[2].FinishReason; got != "STOP" {
+		t.Fatalf("final chunk finishReason = %q, want STOP", got)
+	}
+}
+
+func TestStreamVertexResponseExplicitErrorOverridesEarlyStop(t *testing.T) {
+	body := `[{"results":[{"data":{"candidates":[{"finishReason":"STOP","content":{"role":"model","parts":[{"text":"partial"}]}}]}},{"errors":[{"message":"invalid request","extensions":{"status":{"code":3}}}]}]}]`
+
+	var chunks []CallResult
+	status, err := streamVertexResponse(strings.NewReader(body), func(result *CallResult) error {
+		chunks = append(chunks, *result)
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid request") {
+		t.Fatalf("streamVertexResponse error = %v, want explicit upstream error", err)
+	}
+	if status != 3 {
+		t.Fatalf("status = %d, want 3", status)
+	}
+	if len(chunks) != 1 || chunks[0].TextParts[0].Text != "partial" {
+		t.Fatalf("chunks = %#v, want the partial content only", chunks)
+	}
+	if chunks[0].FinishReason != "" {
+		t.Fatalf("early STOP leaked before the explicit error: %#v", chunks[0])
 	}
 }
 
@@ -1208,8 +1682,9 @@ func TestBuildVertexBodyNormalizesInlineData(t *testing.T) {
 			"parts": []map[string]interface{}{
 				{
 					"inlineData": map[string]interface{}{
-						"mimeType": "image/jpeg",
-						"data":     "data:image/png;base64,aG Vs\nbG8=",
+						"mimeType":    "image/jpeg",
+						"data":        "data:image/png;base64,aG Vs\nbG8=",
+						"displayName": "hello.png",
 					},
 				},
 			},
@@ -1227,6 +1702,55 @@ func TestBuildVertexBodyNormalizesInlineData(t *testing.T) {
 	}
 	if got := inlineData["data"]; got != "aGVsbG8=" {
 		t.Fatalf("data = %v, want normalized base64", got)
+	}
+	if got := inlineData["displayName"]; got != "hello.png" {
+		t.Fatalf("displayName = %v, want hello.png", got)
+	}
+}
+
+func TestBuildVertexBodyNormalizesSnakeCaseInlineData(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{
+					"text": "production Code 3 reproduction",
+				},
+				{
+					"inline_data": map[string]interface{}{
+						"mime_type":    "image/jpeg",
+						"data":         "/9j/2Q==",
+						"display_name": "capture.jpg",
+					},
+				},
+			},
+		},
+	}
+
+	body, err := BuildVertexBody("gemini-3-flash-preview", contents, nil, nil, nil, "token")
+	if err != nil {
+		t.Fatalf("BuildVertexBody returned error: %v", err)
+	}
+
+	part := secondPartFromBody(t, body)
+	if _, exists := part["inline_data"]; exists {
+		t.Fatalf("snake_case inline_data leaked into Vertex body: %v", part)
+	}
+	inlineData, ok := part["inlineData"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("inlineData = %#v, want object", part["inlineData"])
+	}
+	if got := inlineData["mimeType"]; got != "image/jpeg" {
+		t.Fatalf("mimeType = %v, want image/jpeg", got)
+	}
+	if got := inlineData["data"]; got != "/9j/2Q==" {
+		t.Fatalf("data = %v, want normalized JPEG bytes", got)
+	}
+	if got := inlineData["displayName"]; got != "capture.jpg" {
+		t.Fatalf("displayName = %v, want capture.jpg", got)
+	}
+	if _, exists := inlineData["mime_type"]; exists {
+		t.Fatalf("snake_case mime_type leaked into Vertex body: %v", inlineData)
 	}
 }
 
@@ -1608,6 +2132,97 @@ func TestBuildVertexBodyKeepsSupportedImageResponseModality(t *testing.T) {
 	}
 }
 
+func TestBuildVertexBodyNormalizesGenerationConfigResponseSchema(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role":  "user",
+			"parts": []map[string]interface{}{{"text": "Return JSON"}},
+		},
+	}
+	genConfig := map[string]interface{}{
+		"responseMimeType": "application/json",
+		"responseSchema": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"description": map[string]interface{}{
+					"type":      "string",
+					"minLength": 1,
+				},
+				"title": map[string]interface{}{
+					"type":      "string",
+					"minLength": 1,
+					"maxLength": 36,
+				},
+			},
+			"required": []interface{}{"title", "description"},
+		},
+	}
+
+	body, err := BuildVertexBody("gemini-3.6-flash", contents, genConfig, nil, nil, "token")
+	if err != nil {
+		t.Fatalf("BuildVertexBody returned error: %v", err)
+	}
+
+	generationConfig := generationConfigFromBody(t, body)
+	responseSchema := generationConfig["responseSchema"].(map[string]interface{})
+	if got := responseSchema["type"]; got != "OBJECT" {
+		t.Fatalf("responseSchema.type = %v, want OBJECT", got)
+	}
+	properties := responseSchema["properties"].([]interface{})
+	if len(properties) != 2 {
+		t.Fatalf("responseSchema.properties length = %d, want 2", len(properties))
+	}
+	if got := properties[0].(map[string]interface{})["key"]; got != "description" {
+		t.Fatalf("first property key = %v, want description", got)
+	}
+	description := properties[0].(map[string]interface{})["value"].(map[string]interface{})
+	if got := description["type"]; got != "STRING" {
+		t.Fatalf("description.type = %v, want STRING", got)
+	}
+	if got := description["minLength"]; got != float64(1) {
+		t.Fatalf("description.minLength = %v, want 1", got)
+	}
+	if got := properties[1].(map[string]interface{})["key"]; got != "title" {
+		t.Fatalf("second property key = %v, want title", got)
+	}
+}
+
+func TestBuildVertexBodyKeepsGenerationConfigResponseJSONSchemaSemantics(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role":  "user",
+			"parts": []map[string]interface{}{{"text": "Return JSON"}},
+		},
+	}
+	genConfig := map[string]interface{}{
+		"responseMimeType": "application/json",
+		"responseJsonSchema": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"title": map[string]interface{}{"type": "string"},
+			},
+		},
+	}
+
+	body, err := BuildVertexBody("gemini-3.6-flash", contents, genConfig, nil, nil, "token")
+	if err != nil {
+		t.Fatalf("BuildVertexBody returned error: %v", err)
+	}
+
+	generationConfig := generationConfigFromBody(t, body)
+	responseSchema := generationConfig["responseJsonSchema"].(map[string]interface{})
+	if got := responseSchema["type"]; got != "object" {
+		t.Fatalf("responseJsonSchema.type = %v, want object", got)
+	}
+	properties, ok := responseSchema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("responseJsonSchema.properties = %T, want object", responseSchema["properties"])
+	}
+	if got := properties["title"].(map[string]interface{})["type"]; got != "string" {
+		t.Fatalf("responseJsonSchema title type = %v, want string", got)
+	}
+}
+
 func inlineDataFromBody(t *testing.T, body []byte) map[string]interface{} {
 	t.Helper()
 
@@ -1623,6 +2238,16 @@ func firstPartFromBody(t *testing.T, body []byte) map[string]interface{} {
 	content := contents[0].(map[string]interface{})
 	parts := content["parts"].([]interface{})
 	return parts[0].(map[string]interface{})
+}
+
+func secondPartFromBody(t *testing.T, body []byte) map[string]interface{} {
+	t.Helper()
+
+	variables := variablesFromBody(t, body)
+	contents := variables["contents"].([]interface{})
+	content := contents[0].(map[string]interface{})
+	parts := content["parts"].([]interface{})
+	return parts[1].(map[string]interface{})
 }
 
 func generationConfigFromBody(t *testing.T, body []byte) map[string]interface{} {
@@ -1649,6 +2274,25 @@ func TestHTTPStatusForError(t *testing.T) {
 	}
 	if got := HTTPStatusForError(&upstreamHTTPError{Status: http.StatusBadGateway, Body: "bad gateway"}); got != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", got)
+	}
+}
+
+func TestLoggedUpstreamErrorPreservesOriginalClassification(t *testing.T) {
+	cause := &vertexAPIError{Code: 8, Message: "Resource has been exhausted"}
+	marked := markUpstreamErrorLogged(cause)
+
+	if !IsUpstreamErrorLogged(marked) {
+		t.Fatal("marked upstream error was not recognized as already logged")
+	}
+	if marked.Error() != cause.Error() {
+		t.Fatalf("marked error = %q, want %q", marked.Error(), cause.Error())
+	}
+	var vertexErr *vertexAPIError
+	if !errors.As(marked, &vertexErr) || vertexErr != cause {
+		t.Fatalf("marked error no longer unwraps to original cause: %v", marked)
+	}
+	if got := HTTPStatusForError(marked); got != http.StatusTooManyRequests {
+		t.Fatalf("HTTP status = %d, want 429", got)
 	}
 }
 

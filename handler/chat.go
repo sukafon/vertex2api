@@ -21,6 +21,7 @@ import (
 // ChatCompletions 处理 POST /v1/chat/completions
 func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerOpenAIChatCompletions))
 		var req model.ChatCompletionRequest
 		_, ok := readJSONRequest(w, r, &req)
 		if !ok {
@@ -91,7 +92,7 @@ func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Han
 					log.Debug().Err(err).Str("model", req.Model).Msg("OpenAI stream request canceled before upstream call")
 					return
 				}
-				log.Error().Err(err).Str("model", req.Model).Msg("Build Vertex request failed")
+				log.Error().Err(err).Str("model", req.Model).Msg("OpenAI Chat Completions request conversion failed")
 				WriteJSON(w, http.StatusInternalServerError, publicServerErrorResponse(err))
 				return
 			}
@@ -107,8 +108,10 @@ func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Han
 				log.Debug().Err(err).Str("model", req.Model).Msg("OpenAI request canceled")
 				return
 			}
-			log.Error().Str("err", vp.UpstreamLogError(err)).Str("model", req.Model).Msg("Vertex API call failed")
-			writeUpstreamProtocolError(w, r, err)
+			if !proxy.IsUpstreamErrorLogged(err) {
+				log.Error().Str("err", vp.UpstreamLogError(err)).Str("model", req.Model).Msg("OpenAI Chat Completions call failed")
+			}
+			writeUpstreamProtocolError(w, r, vp, err)
 			return
 		}
 
@@ -175,6 +178,20 @@ func validateOpenAIRequest(req model.ChatCompletionRequest) string {
 			return "response_format.type must be text, json_object, or json_schema"
 		}
 	}
+	for index, tool := range req.Tools {
+		toolType, _ := tool["type"].(string)
+		if toolType == "function" {
+			function, ok := mapValue(tool, "function")
+			name, _ := function["name"].(string)
+			if !ok || strings.TrimSpace(name) == "" {
+				return fmt.Sprintf("tools[%d].function.name is required", index)
+			}
+			continue
+		}
+		if _, ok := convertNativeGeminiTool(tool); !ok {
+			return fmt.Sprintf("tools[%d].type %q has no Vertex equivalent", index, toolType)
+		}
+	}
 	return ""
 }
 
@@ -185,14 +202,14 @@ func validateOpenAIReasoningEffort(modelName string, effort *string) string {
 
 	normalized := strings.ToLower(strings.TrimSpace(*effort))
 	switch normalized {
-	case "minimal", "low", "medium", "high", "xhigh":
+	case "minimal", "low", "medium", "high", "xhigh", "max":
 	case "none":
 		if strings.HasPrefix(strings.ToLower(modelName), "gemini-2.5-") && !strings.Contains(strings.ToLower(modelName), "pro") {
 			return ""
 		}
 		return "reasoning_effort none is not supported by this model"
 	default:
-		return "reasoning_effort must be none, minimal, low, medium, high, or xhigh"
+		return "reasoning_effort must be none, minimal, low, medium, high, xhigh, or max"
 	}
 
 	lowerModel := strings.ToLower(modelName)
@@ -211,7 +228,7 @@ func openAIReasoningConfig(modelName string, effort *string) map[string]interfac
 	lowerModel := strings.ToLower(modelName)
 	if strings.HasPrefix(lowerModel, "gemini-3") {
 		level := strings.ToUpper(normalized)
-		if normalized == "xhigh" {
+		if normalized == "xhigh" || normalized == "max" {
 			level = "HIGH"
 		}
 		// Gemini Pro models do not expose a minimal level; Google's OpenAI
@@ -229,7 +246,7 @@ func openAIReasoningConfig(modelName string, effort *string) map[string]interfac
 			budget = 1024
 		case "medium":
 			budget = 8192
-		case "high", "xhigh":
+		case "high", "xhigh", "max":
 			budget = 24576
 		}
 		return map[string]interface{}{"thinkingBudget": budget}
@@ -311,6 +328,8 @@ func sendChatResponse(w http.ResponseWriter, req model.ChatCompletionRequest, mo
 
 func callResultFromCandidate(candidate proxy.CandidateResult) *proxy.CallResult {
 	return &proxy.CallResult{
+		Parts:             candidate.Parts,
+		Role:              candidate.Role,
 		TextParts:         candidate.TextParts,
 		ImageParts:        candidate.ImageParts,
 		FunctionCalls:     candidate.FunctionCalls,
@@ -391,7 +410,6 @@ func streamResponseForRequestWithProxy(
 ) {
 	modelName := req.Model
 
-	finishReason := "stop"
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	streamState := &openAIStreamState{}
 	aggregate := &proxy.CallResult{}
@@ -406,9 +424,6 @@ func streamResponseForRequestWithProxy(
 			return nil
 		}
 		accumulateCallResult(aggregate, result)
-		if result.FinishReason != "" || len(result.FunctionCalls) > 0 {
-			finishReason = openAIFinishReason(result)
-		}
 		if !result.HasContent() {
 			return nil
 		}
@@ -423,12 +438,14 @@ func streamResponseForRequestWithProxy(
 			log.Debug().Err(err).Str("model", modelName).Msg("OpenAI stream client disconnected")
 			return
 		}
-		log.Error().Str("err", upstreamLogError(vp, err)).Str("model", modelName).Msg("Vertex API stream failed")
+		if !proxy.IsUpstreamErrorLogged(err) {
+			log.Error().Str("err", upstreamLogError(vp, err)).Str("model", modelName).Msg("OpenAI Chat Completions stream failed")
+		}
 		if !committed {
-			writeUpstreamProtocolError(w, r, err)
+			writeUpstreamProtocolError(w, r, vp, err)
 			return
 		}
-		_ = writeOpenAIStreamError(w, err)
+		_ = writeOpenAIStreamError(w, vp, err)
 		return
 	}
 	if err := ctx.Err(); err != nil {
@@ -442,6 +459,10 @@ func streamResponseForRequestWithProxy(
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		usage, _ = openAIUsage(req, aggregate)
 	}
+	// Emit the protocol terminator only after the upstream stream reaches EOF.
+	// Vertex finishReason is completion metadata and may arrive before later
+	// content chunks, so it must never end the downstream stream by itself.
+	finishReason := openAIFinishReason(aggregate)
 	if err := writeOpenAIStreamEnd(w, id, modelName, finishReason, usage); err != nil {
 		if requestContextCanceled(ctx, err) {
 			log.Debug().Err(err).Str("model", modelName).Msg("OpenAI stream client disconnected")
@@ -455,6 +476,7 @@ func accumulateCallResult(dst, src *proxy.CallResult) {
 	if dst == nil || src == nil {
 		return
 	}
+	dst.Parts = append(dst.Parts, src.Parts...)
 	dst.TextParts = append(dst.TextParts, src.TextParts...)
 	dst.ImageParts = append(dst.ImageParts, src.ImageParts...)
 	dst.FunctionCalls = append(dst.FunctionCalls, src.FunctionCalls...)
@@ -463,6 +485,24 @@ func accumulateCallResult(dst, src *proxy.CallResult) {
 	}
 	if len(src.UsageMetadata) > 0 {
 		dst.UsageMetadata = src.UsageMetadata
+	}
+	if src.GroundingMetadata != nil {
+		dst.GroundingMetadata = src.GroundingMetadata
+	}
+	if len(src.PromptFeedback) > 0 {
+		dst.PromptFeedback = src.PromptFeedback
+	}
+	if len(src.ModelStatus) > 0 {
+		dst.ModelStatus = src.ModelStatus
+	}
+	if src.ModelVersion != "" {
+		dst.ModelVersion = src.ModelVersion
+	}
+	if src.ResponseID != "" {
+		dst.ResponseID = src.ResponseID
+	}
+	if src.CreateTime != "" {
+		dst.CreateTime = src.CreateTime
 	}
 }
 
@@ -543,10 +583,10 @@ func writeOpenAIStreamEnd(w http.ResponseWriter, id, modelName, finishReason str
 	return flushResponse(w)
 }
 
-func writeOpenAIStreamError(w http.ResponseWriter, streamErr error) error {
+func writeOpenAIStreamError(w http.ResponseWriter, vp *proxy.VertexProxy, streamErr error) error {
 	status := proxy.HTTPStatusForError(streamErr)
 	data, _ := sonic.Marshal(model.ErrorResponse{Error: &model.APIError{
-		Message: publicServerErrorMessageFor(streamErr),
+		Message: publicUpstreamErrorMessage(vp, streamErr),
 		Type:    openAIErrorType(status),
 	}})
 	if _, err := io.WriteString(w, "data: "); err != nil {
@@ -617,22 +657,45 @@ func openAIAnnotationsFromGrounding(gm *model.GroundingMetadata) []model.ChatAnn
 			continue
 		}
 		for _, chunkIndex := range support.GroundingChunkIndices {
-			if chunkIndex < 0 || chunkIndex >= len(gm.GroundingChunks) || gm.GroundingChunks[chunkIndex].Web == nil {
+			if chunkIndex < 0 || chunkIndex >= len(gm.GroundingChunks) {
 				continue
 			}
-			web := gm.GroundingChunks[chunkIndex].Web
+			uri, title := groundingChunkLink(gm.GroundingChunks[chunkIndex])
+			if uri == "" {
+				continue
+			}
 			annotations = append(annotations, model.ChatAnnotation{
 				Type: "url_citation",
 				URLCitation: &model.ChatURLCitation{
 					StartIndex: support.Segment.StartIndex,
 					EndIndex:   support.Segment.EndIndex,
-					URL:        web.URI,
-					Title:      web.Title,
+					URL:        uri,
+					Title:      title,
 				},
 			})
 		}
 	}
 	return annotations
+}
+
+func groundingChunkLink(chunk model.GroundingChunk) (string, string) {
+	if chunk.Web != nil {
+		return chunk.Web.URI, chunk.Web.Title
+	}
+	if len(chunk.RetrievedContext) > 0 {
+		uri, _ := chunk.RetrievedContext["uri"].(string)
+		title, _ := chunk.RetrievedContext["title"].(string)
+		return uri, title
+	}
+	if len(chunk.Maps) > 0 {
+		uri, _ := chunk.Maps["uri"].(string)
+		if uri == "" {
+			uri, _ = chunk.Maps["googleMapsUri"].(string)
+		}
+		title, _ := chunk.Maps["title"].(string)
+		return uri, title
+	}
+	return "", ""
 }
 
 type openAIStreamState struct {
@@ -686,8 +749,6 @@ func openAIFinishReason(result *proxy.CallResult) string {
 	switch strings.ToUpper(result.FinishReason) {
 	case "MAX_TOKENS":
 		return "length"
-	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY":
-		return "content_filter"
 	default:
 		return "stop"
 	}
@@ -815,23 +876,7 @@ func buildResponseContent(result *proxy.CallResult) (content interface{}, reason
 	if result == nil {
 		return "", ""
 	}
-	hasImages := len(result.ImageParts) > 0
-
-	if hasImages {
-		return buildMarkdownResponseContent(result), ""
-	}
-
-	var contentBuilder, reasoningBuilder strings.Builder
-	for _, part := range result.TextParts {
-		if part.Thought {
-			reasoningBuilder.WriteString(part.Text)
-		} else {
-			contentBuilder.WriteString(part.Text)
-		}
-	}
-
-	cStr := contentBuilder.String()
-	rStr := reasoningBuilder.String()
+	cStr, rStr := buildOpenAITextAndReasoning(result)
 	if cStr == "" && len(result.FunctionCalls) > 0 {
 		return nil, rStr
 	}
@@ -842,12 +887,46 @@ func buildStreamResponseContent(result *proxy.CallResult) (content interface{}, 
 	if result == nil {
 		return nil, ""
 	}
-	hasImages := len(result.ImageParts) > 0
-	if hasImages {
-		return buildMarkdownResponseContent(result), ""
+	cStr, rStr := buildOpenAITextAndReasoning(result)
+	if cStr == "" {
+		return nil, rStr
+	}
+	return cStr, rStr
+}
+
+func buildOpenAITextAndReasoning(result *proxy.CallResult) (string, string) {
+	var contentBuilder, reasoningBuilder strings.Builder
+	if len(result.Parts) > 0 {
+		for _, part := range result.Parts {
+			switch {
+			case part.Text != "":
+				if part.Thought {
+					reasoningBuilder.WriteString(part.Text)
+				} else {
+					contentBuilder.WriteString(part.Text)
+				}
+			case part.InlineData != nil && part.InlineData.Data != "":
+				appendMarkdownSeparator(&contentBuilder)
+				contentBuilder.WriteString("![image](")
+				contentBuilder.WriteString(imageDataURL(*part.InlineData))
+				contentBuilder.WriteString(")")
+			case len(part.FileData) > 0:
+				uri, _ := part.FileData["fileUri"].(string)
+				if uri != "" {
+					appendMarkdownSeparator(&contentBuilder)
+					contentBuilder.WriteString("[file](")
+					contentBuilder.WriteString(uri)
+					contentBuilder.WriteString(")")
+				}
+			case len(part.ExecutableCode) > 0:
+				appendExecutableCodeMarkdown(&contentBuilder, part.ExecutableCode)
+			case len(part.CodeExecutionResult) > 0:
+				appendCodeExecutionResultMarkdown(&contentBuilder, part.CodeExecutionResult)
+			}
+		}
+		return contentBuilder.String(), reasoningBuilder.String()
 	}
 
-	var contentBuilder, reasoningBuilder strings.Builder
 	for _, part := range result.TextParts {
 		if part.Thought {
 			reasoningBuilder.WriteString(part.Text)
@@ -855,29 +934,44 @@ func buildStreamResponseContent(result *proxy.CallResult) (content interface{}, 
 			contentBuilder.WriteString(part.Text)
 		}
 	}
-
-	cStr := contentBuilder.String()
-	rStr := reasoningBuilder.String()
-	if cStr == "" {
-		return nil, rStr
+	for _, img := range result.ImageParts {
+		appendMarkdownSeparator(&contentBuilder)
+		contentBuilder.WriteString("![image](")
+		contentBuilder.WriteString(imageDataURL(img))
+		contentBuilder.WriteString(")")
 	}
-	return cStr, rStr
+	return contentBuilder.String(), reasoningBuilder.String()
 }
 
-func buildMarkdownResponseContent(result *proxy.CallResult) string {
-	var b strings.Builder
-	b.WriteString(joinTextParts(result.TextParts))
-
-	for _, img := range result.ImageParts {
-		if b.Len() > 0 {
-			b.WriteString("\n\n")
-		}
-		b.WriteString("![image](")
-		b.WriteString(imageDataURL(img))
-		b.WriteString(")")
+func appendMarkdownSeparator(builder *strings.Builder) {
+	if builder.Len() > 0 {
+		builder.WriteString("\n\n")
 	}
+}
 
-	return b.String()
+func appendExecutableCodeMarkdown(builder *strings.Builder, value map[string]interface{}) {
+	code, _ := value["code"].(string)
+	if code == "" {
+		return
+	}
+	language, _ := value["language"].(string)
+	appendMarkdownSeparator(builder)
+	builder.WriteString("```")
+	builder.WriteString(strings.ToLower(language))
+	builder.WriteByte('\n')
+	builder.WriteString(code)
+	builder.WriteString("\n```")
+}
+
+func appendCodeExecutionResultMarkdown(builder *strings.Builder, value map[string]interface{}) {
+	output, _ := value["output"].(string)
+	if output == "" {
+		return
+	}
+	appendMarkdownSeparator(builder)
+	builder.WriteString("```text\n")
+	builder.WriteString(output)
+	builder.WriteString("\n```")
 }
 
 func imageDataURL(img model.InlineData) string {
@@ -886,14 +980,6 @@ func imageDataURL(img model.InlineData) string {
 		mimeType = "image/png"
 	}
 	return fmt.Sprintf("data:%s;base64,%s", mimeType, img.Data)
-}
-
-func joinTextParts(parts []model.TextPart) string {
-	var b strings.Builder
-	for _, part := range parts {
-		b.WriteString(part.Text)
-	}
-	return b.String()
 }
 
 func convertMessages(modelName string, messages []model.ChatMessage) ([]map[string]interface{}, interface{}) {
@@ -951,6 +1037,9 @@ func convertMessages(modelName string, messages []model.ChatMessage) ([]map[stri
 				vertexRole = "model"
 			}
 			parts = convertContentToParts(msg.Content)
+			if vertexRole == "model" && msg.ReasoningContent != "" {
+				parts = append([]map[string]interface{}{{"text": msg.ReasoningContent, "thought": true}}, parts...)
+			}
 			for _, toolCall := range msg.ToolCalls {
 				if toolCall.ID != "" && toolCall.Function != nil {
 					toolCallNames[toolCall.ID] = toolCall.Function.Name
@@ -1137,21 +1226,64 @@ func convertContentToParts(content interface{}) []map[string]interface{} {
 			case "image_url":
 				if imgURL, ok := m["image_url"].(map[string]interface{}); ok {
 					url, _ := imgURL["url"].(string)
-					mimeType, b64Data := parseDataURL(url)
-					if b64Data != "" {
+					if strings.HasPrefix(url, "data:") {
+						mimeType, b64Data := parseDataURL(url)
 						parts = append(parts, map[string]interface{}{
 							"inlineData": map[string]interface{}{
 								"mimeType": mimeType,
 								"data":     b64Data,
 							},
 						})
+					} else if url != "" {
+						parts = append(parts, map[string]interface{}{
+							"fileData": map[string]interface{}{"fileUri": url},
+						})
 					}
+				}
+			case "file":
+				file, _ := m["file"].(map[string]interface{})
+				fileData, _ := file["file_data"].(string)
+				fileURL, _ := file["file_url"].(string)
+				if fileData != "" {
+					mimeType, data := parseDataURL(fileData)
+					if !strings.HasPrefix(fileData, "data:") {
+						mimeType = "application/octet-stream"
+					}
+					parts = append(parts, map[string]interface{}{"inlineData": map[string]interface{}{"mimeType": mimeType, "data": data}})
+				} else if fileURL != "" {
+					parts = append(parts, map[string]interface{}{"fileData": map[string]interface{}{"fileUri": fileURL}})
+				}
+			case "input_audio":
+				audio, _ := m["input_audio"].(map[string]interface{})
+				data, _ := audio["data"].(string)
+				format, _ := audio["format"].(string)
+				if data != "" {
+					parts = append(parts, map[string]interface{}{"inlineData": map[string]interface{}{
+						"mimeType": audioFormatMimeType(format), "data": data,
+					}})
 				}
 			}
 		}
 		return parts
 	}
 	return []map[string]interface{}{{"text": fmt.Sprintf("%v", content)}}
+}
+
+func audioFormatMimeType(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "wav", "wave":
+		return "audio/wav"
+	case "mp3", "mpeg":
+		return "audio/mpeg"
+	case "flac":
+		return "audio/flac"
+	case "m4a", "mp4":
+		return "audio/mp4"
+	case "ogg", "opus":
+		return "audio/ogg"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // parseDataURL 解析 data:mime;base64,DATA 格式的 URL

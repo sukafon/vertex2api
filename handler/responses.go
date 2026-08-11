@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -46,6 +47,7 @@ func NewResponsesAPI(vp *proxy.VertexProxy, allowCustomModelNames bool, compactS
 // Responses handles POST /v1/responses.
 func (api *ResponsesAPI) Responses() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerOpenAIResponses))
 		var req model.ResponseRequest
 		if _, ok := readJSONRequest(w, r, &req); !ok {
 			return
@@ -65,8 +67,10 @@ func (api *ResponsesAPI) Responses() http.Handler {
 			if requestContextCanceled(r.Context(), err) {
 				return
 			}
-			log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("Responses compaction failed")
-			writeUpstreamProtocolError(w, r, err)
+			if !proxy.IsUpstreamErrorLogged(err) {
+				log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("OpenAI Responses compaction failed")
+			}
+			writeUpstreamProtocolError(w, r, api.vp, err)
 			return
 		}
 
@@ -84,18 +88,20 @@ func (api *ResponsesAPI) Responses() http.Handler {
 				return
 			}
 			api.streamResponse(w, r, req, chatReq, compactItem, toolKinds, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
-				return api.vp.StreamWithTokenContext(ctx, bodyJSON, tokenLease, onChunk)
+				return api.vp.StreamWithTokenRequireAssistantOutputContext(ctx, bodyJSON, tokenLease, onChunk)
 			})
 			return
 		}
 
-		result, err := api.vp.CallWithTokenWithOptionsContext(r.Context(), req.Model, contents, genConfig, nil, systemInstruction, options)
+		result, err := api.vp.CallWithTokenWithOptionsRequireAssistantOutputContext(r.Context(), req.Model, contents, genConfig, nil, systemInstruction, options)
 		if err != nil {
 			if requestContextCanceled(r.Context(), err) {
 				return
 			}
-			log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("Vertex Responses call failed")
-			writeUpstreamProtocolError(w, r, err)
+			if !proxy.IsUpstreamErrorLogged(err) {
+				log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("OpenAI Responses call failed")
+			}
+			writeUpstreamProtocolError(w, r, api.vp, err)
 			return
 		}
 
@@ -104,6 +110,14 @@ func (api *ResponsesAPI) Responses() http.Handler {
 			w.Header().Set("X-Usage-Estimated", "true")
 		}
 		output := buildResponseOutput(result, toolKinds)
+		if len(output) == 0 {
+			log.Error().
+				Str("model", req.Model).
+				Str("finish_reason", result.FinishReason).
+				Msg("OpenAI Responses call completed without assistant output")
+			WriteProtocolError(w, r, http.StatusBadGateway, proxy.ErrNoAssistantOutput.Error(), "server_error")
+			return
+		}
 		if compactItem != nil {
 			output = append([]map[string]interface{}{compactItem}, output...)
 		}
@@ -115,6 +129,7 @@ func (api *ResponsesAPI) Responses() http.Handler {
 // Compact handles POST /v1/responses/compact.
 func (api *ResponsesAPI) Compact() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerOpenAIResponses))
 		var req model.ResponseCompactRequest
 		if _, ok := readJSONRequest(w, r, &req); !ok {
 			return
@@ -137,8 +152,10 @@ func (api *ResponsesAPI) Compact() http.Handler {
 			if requestContextCanceled(r.Context(), err) {
 				return
 			}
-			log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("Standalone Responses compact failed")
-			writeUpstreamProtocolError(w, r, err)
+			if !proxy.IsUpstreamErrorLogged(err) {
+				log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("OpenAI Responses compact call failed")
+			}
+			writeUpstreamProtocolError(w, r, api.vp, err)
 			return
 		}
 
@@ -232,7 +249,7 @@ func writeResponseRequestError(w http.ResponseWriter, message string) {
 	}})
 }
 
-func (api *ResponsesAPI) responseRequestToChat(req model.ResponseRequest) (model.ChatCompletionRequest, map[string]string, error) {
+func (api *ResponsesAPI) responseRequestToChat(req model.ResponseRequest) (model.ChatCompletionRequest, responseToolBindings, error) {
 	messages, err := api.responseInputToMessages(req.Input)
 	if err != nil {
 		return model.ChatCompletionRequest{}, nil, err
@@ -240,7 +257,7 @@ func (api *ResponsesAPI) responseRequestToChat(req model.ResponseRequest) (model
 	if req.Instructions != "" {
 		messages = append([]model.ChatMessage{{Role: "developer", Content: req.Instructions}}, messages...)
 	}
-	tools, toolKinds, err := responseToolsToChat(req.Tools)
+	tools, toolKinds, err := responseToolsToChatWithChoice(req.Tools, req.ToolChoice)
 	if err != nil {
 		return model.ChatCompletionRequest{}, nil, err
 	}
@@ -268,12 +285,24 @@ func (api *ResponsesAPI) responseRequestToChat(req model.ResponseRequest) (model
 	return chatReq, toolKinds, nil
 }
 
-func responseToolsToChat(tools []map[string]interface{}) ([]map[string]interface{}, map[string]string, error) {
+type responseToolBinding struct {
+	Kind      string
+	Namespace string
+	Name      string
+}
+
+type responseToolBindings map[string]responseToolBinding
+
+func responseToolsToChat(tools []map[string]interface{}) ([]map[string]interface{}, responseToolBindings, error) {
+	return responseToolsToChatWithChoice(tools, nil)
+}
+
+func responseToolsToChatWithChoice(tools []map[string]interface{}, toolChoice interface{}) ([]map[string]interface{}, responseToolBindings, error) {
 	if len(tools) == 0 {
 		return nil, nil, nil
 	}
 	converted := make([]map[string]interface{}, 0, len(tools))
-	kinds := make(map[string]string)
+	bindings := make(responseToolBindings)
 	for _, tool := range tools {
 		toolType, _ := tool["type"].(string)
 		switch toolType {
@@ -282,14 +311,74 @@ func responseToolsToChat(tools []map[string]interface{}) ([]map[string]interface
 			if name == "" {
 				return nil, nil, errors.New("tools[].name is required for function tools")
 			}
+			if err := registerResponseToolBinding(bindings, name, responseToolBinding{Kind: "function", Name: name}); err != nil {
+				return nil, nil, err
+			}
 			function := copyInterfaceMap(tool)
 			delete(function, "type")
 			converted = append(converted, map[string]interface{}{"type": "function", "function": function})
-			kinds[name] = "function"
+		case "namespace":
+			namespaceName, _ := tool["name"].(string)
+			namespaceName = strings.TrimSpace(namespaceName)
+			if namespaceName == "" {
+				return nil, nil, errors.New("tools[].name is required for namespace tools")
+			}
+			namespaceTools, ok := tool["tools"].([]interface{})
+			if !ok || len(namespaceTools) == 0 {
+				return nil, nil, fmt.Errorf("namespace tool %q must contain at least one function in tools", namespaceName)
+			}
+			for nestedIndex, rawNestedTool := range namespaceTools {
+				nestedTool, ok := rawNestedTool.(map[string]interface{})
+				if !ok {
+					return nil, nil, fmt.Errorf("namespace tool %q tools[%d] must be an object", namespaceName, nestedIndex)
+				}
+				nestedType, _ := nestedTool["type"].(string)
+				if nestedType != "function" {
+					return nil, nil, fmt.Errorf("namespace tool %q tools[%d] type %q is not supported", namespaceName, nestedIndex, nestedType)
+				}
+				nestedName, _ := nestedTool["name"].(string)
+				nestedName = strings.TrimSpace(nestedName)
+				if nestedName == "" {
+					return nil, nil, fmt.Errorf("namespace tool %q tools[%d].name is required", namespaceName, nestedIndex)
+				}
+
+				// Vertex function declarations are flat. Codex addresses namespace
+				// members using the same double-underscore form used by its tool
+				// runtime, so the mapping remains reversible for tool calls.
+				name := flattenResponseNamespaceToolName(namespaceName, nestedName)
+				if err := registerResponseToolBinding(bindings, name, responseToolBinding{
+					Kind: "function", Namespace: namespaceName, Name: nestedName,
+				}); err != nil {
+					return nil, nil, err
+				}
+				parameters := nestedTool["inputSchema"]
+				if parameters == nil {
+					parameters = nestedTool["input_schema"]
+				}
+				if parameters == nil {
+					parameters = nestedTool["parameters"]
+				}
+				if parameters == nil {
+					parameters = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+				}
+				function := map[string]interface{}{
+					"name":       name,
+					"parameters": parameters,
+				}
+				if description, _ := nestedTool["description"].(string); description != "" {
+					function["description"] = description
+				} else if description, _ := tool["description"].(string); description != "" {
+					function["description"] = description
+				}
+				converted = append(converted, map[string]interface{}{"type": "function", "function": function})
+			}
 		case "custom":
 			name, _ := tool["name"].(string)
 			if name == "" {
 				return nil, nil, errors.New("tools[].name is required for custom tools")
+			}
+			if err := registerResponseToolBinding(bindings, name, responseToolBinding{Kind: "custom", Name: name}); err != nil {
+				return nil, nil, err
 			}
 			function := map[string]interface{}{
 				"name": name,
@@ -303,9 +392,11 @@ func responseToolsToChat(tools []map[string]interface{}) ([]map[string]interface
 				function["description"] = description
 			}
 			converted = append(converted, map[string]interface{}{"type": "function", "function": function})
-			kinds[name] = "custom"
 		case "local_shell":
 			name := "local_shell"
+			if err := registerResponseToolBinding(bindings, name, responseToolBinding{Kind: "local_shell", Name: name}); err != nil {
+				return nil, nil, err
+			}
 			converted = append(converted, map[string]interface{}{
 				"type": "function",
 				"function": map[string]interface{}{
@@ -322,9 +413,11 @@ func responseToolsToChat(tools []map[string]interface{}) ([]map[string]interface
 					},
 				},
 			})
-			kinds[name] = "local_shell"
 		case "shell":
 			name := "shell"
+			if err := registerResponseToolBinding(bindings, name, responseToolBinding{Kind: "shell", Name: name}); err != nil {
+				return nil, nil, err
+			}
 			converted = append(converted, map[string]interface{}{
 				"type": "function",
 				"function": map[string]interface{}{
@@ -341,9 +434,11 @@ func responseToolsToChat(tools []map[string]interface{}) ([]map[string]interface
 					},
 				},
 			})
-			kinds[name] = "shell"
 		case "apply_patch":
 			name := "apply_patch"
+			if err := registerResponseToolBinding(bindings, name, responseToolBinding{Kind: "apply_patch", Name: name}); err != nil {
+				return nil, nil, err
+			}
 			converted = append(converted, map[string]interface{}{
 				"type": "function",
 				"function": map[string]interface{}{
@@ -360,12 +455,116 @@ func responseToolsToChat(tools []map[string]interface{}) ([]map[string]interface
 					},
 				},
 			})
-			kinds[name] = "apply_patch"
+		case "web_search", "web_search_2025_08_26", "web_search_preview", "web_search_preview_2025_03_11":
+			cacheOnly, err := validateResponsesWebSearchTool(toolType, tool)
+			if err != nil {
+				return nil, nil, err
+			}
+			if cacheOnly {
+				if responseToolChoiceRequiresWebSearch(toolChoice) {
+					return nil, nil, errors.New("当前后端不支持强制使用缓存索引进行网页搜索。请移除网页搜索工具，或前往“配置 → 网页搜索”，选择“已索引”、“实时”或“已禁用”。")
+				}
+				continue
+			}
+			allowedKeys := []string{"type", "external_web_access"}
+			if !strings.HasPrefix(toolType, "web_search_preview") {
+				allowedKeys = append(allowedKeys, "indexed_web_access")
+			}
+			if unsupported := responseToolUnsupportedKeys(tool, allowedKeys...); len(unsupported) > 0 {
+				return nil, nil, fmt.Errorf("tool type %q fields %s have no Vertex Google Search equivalent", toolType, strings.Join(unsupported, ", "))
+			}
+			converted = append(converted, map[string]interface{}{"type": toolType})
+		case "code_interpreter", "code_execution":
+			if unsupported := responseToolUnsupportedKeys(tool, "type", "container"); len(unsupported) > 0 {
+				return nil, nil, fmt.Errorf("tool type %q fields %s have no Vertex code execution equivalent", toolType, strings.Join(unsupported, ", "))
+			}
+			if container, ok := tool["container"].(map[string]interface{}); ok {
+				containerType, _ := container["type"].(string)
+				fileIDs, _ := container["file_ids"].([]interface{})
+				if (containerType != "" && containerType != "auto") || len(fileIDs) > 0 || len(responseToolUnsupportedKeys(container, "type", "file_ids")) > 0 {
+					return nil, nil, errors.New("code_interpreter.container is only supported as auto without file_ids")
+				}
+			}
+			converted = append(converted, map[string]interface{}{"type": toolType})
+		case "url_context":
+			if unsupported := responseToolUnsupportedKeys(tool, "type"); len(unsupported) > 0 {
+				return nil, nil, fmt.Errorf("url_context fields %s have no Vertex equivalent", strings.Join(unsupported, ", "))
+			}
+			converted = append(converted, map[string]interface{}{"type": toolType})
 		default:
 			return nil, nil, fmt.Errorf("tool type %q is not supported by this Responses adapter", toolType)
 		}
 	}
-	return converted, kinds, nil
+	return converted, bindings, nil
+}
+
+func validateResponsesWebSearchTool(toolType string, tool map[string]interface{}) (bool, error) {
+	rawExternalAccess, exists := tool["external_web_access"]
+	externalAccess := true
+	if exists {
+		var ok bool
+		externalAccess, ok = rawExternalAccess.(bool)
+		if !ok {
+			return false, errors.New("web_search.external_web_access must be a boolean")
+		}
+	}
+	if strings.HasPrefix(toolType, "web_search_preview") {
+		// OpenAI preview search ignores this field and always uses live access,
+		// which matches Vertex Google Search behavior.
+		return false, nil
+	}
+	if rawIndexedAccess, indexedExists := tool["indexed_web_access"]; indexedExists {
+		indexedAccess, ok := rawIndexedAccess.(bool)
+		if !ok {
+			return false, errors.New("web_search.indexed_web_access must be a boolean")
+		}
+		if indexedAccess && !externalAccess {
+			return false, errors.New("web_search.indexed_web_access=true requires external_web_access=true")
+		}
+	}
+	return !externalAccess, nil
+}
+
+func responseToolChoiceRequiresWebSearch(choice interface{}) bool {
+	if value, ok := choice.(string); ok {
+		return value == "required"
+	}
+	tool, ok := choice.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	toolType, _ := tool["type"].(string)
+	return strings.HasPrefix(toolType, "web_search")
+}
+
+func registerResponseToolBinding(bindings responseToolBindings, name string, binding responseToolBinding) error {
+	if _, exists := bindings[name]; exists {
+		return fmt.Errorf("duplicate Responses tool name %q after namespace expansion", name)
+	}
+	bindings[name] = binding
+	return nil
+}
+
+func flattenResponseNamespaceToolName(namespace, name string) string {
+	if strings.HasSuffix(namespace, "__") {
+		return namespace + name
+	}
+	return namespace + "__" + name
+}
+
+func responseToolUnsupportedKeys(tool map[string]interface{}, allowed ...string) []string {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowedSet[key] = struct{}{}
+	}
+	unsupported := make([]string, 0)
+	for key := range tool {
+		if _, ok := allowedSet[key]; !ok {
+			unsupported = append(unsupported, key)
+		}
+	}
+	sort.Strings(unsupported)
+	return unsupported
 }
 
 func responseToolChoiceToChat(choice interface{}) interface{} {
@@ -375,7 +574,11 @@ func responseToolChoiceToChat(choice interface{}) interface{} {
 	}
 	toolType, _ := m["type"].(string)
 	name, _ := m["name"].(string)
+	namespace, _ := m["namespace"].(string)
 	if (toolType == "function" || toolType == "custom") && name != "" {
+		if toolType == "function" && namespace != "" {
+			name = flattenResponseNamespaceToolName(namespace, name)
+		}
 		return map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": name}}
 	}
 	if toolType == "local_shell" || toolType == "shell" || toolType == "apply_patch" {
@@ -476,12 +679,22 @@ func (api *ResponsesAPI) responseInputItemToMessages(item map[string]interface{}
 		if err != nil {
 			return nil, err
 		}
+		phase, _ := item["phase"].(string)
+		if role == "assistant" && phase == "commentary" {
+			if reasoning := extractTextContent(content); reasoning != "" {
+				return []model.ChatMessage{{Role: role, Content: nil, ReasoningContent: reasoning}}, nil
+			}
+		}
 		return []model.ChatMessage{{Role: role, Content: content}}, nil
 	case "function_call":
 		name, _ := item["name"].(string)
+		namespace, _ := item["namespace"].(string)
 		callID, _ := item["call_id"].(string)
 		if name == "" || callID == "" {
 			return nil, errors.New("function_call.name and function_call.call_id are required")
+		}
+		if namespace != "" {
+			name = flattenResponseNamespaceToolName(namespace, name)
 		}
 		arguments := responseStringOrJSON(item["arguments"])
 		return []model.ChatMessage{{Role: "assistant", Content: nil, ToolCalls: []model.ChatToolCall{{
@@ -545,6 +758,26 @@ func (api *ResponsesAPI) responseInputItemToMessages(item map[string]interface{}
 		}
 		return []model.ChatMessage{{Role: "tool", ToolCallID: callID, Name: name, Content: responseOutputContent(item["output"])}}, nil
 	case "reasoning":
+		var reasoning strings.Builder
+		for _, field := range []string{"summary", "content"} {
+			items, _ := item[field].([]interface{})
+			for _, raw := range items {
+				part, _ := raw.(map[string]interface{})
+				text, _ := part["text"].(string)
+				if text != "" {
+					reasoning.WriteString(text)
+				}
+			}
+		}
+		if reasoning.Len() == 0 {
+			return nil, nil
+		}
+		return []model.ChatMessage{{Role: "assistant", Content: nil, ReasoningContent: reasoning.String()}}, nil
+	case "web_search_call":
+		// A Responses web_search_call is hosted-tool activity metadata. Vertex
+		// represents Google Search grounding outside the conversational contents,
+		// while the adjacent assistant message carries the conversational text.
+		// Keep that message and omit this non-content item during a replay.
 		return nil, nil
 	case "compaction":
 		encrypted, _ := item["encrypted_content"].(string)
@@ -590,7 +823,29 @@ func responseContentToChat(content interface{}) (interface{}, error) {
 			}
 			parts = append(parts, map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": imageURL}})
 		case "input_file":
-			return nil, errors.New("input_file is not supported by the Vertex adapter")
+			file := map[string]interface{}{}
+			for _, key := range []string{"file_data", "file_url", "file_id", "filename"} {
+				if value, exists := part[key]; exists {
+					file[key] = value
+				}
+			}
+			if file["file_data"] == nil && file["file_url"] == nil {
+				if file["file_id"] != nil {
+					return nil, errors.New("input_file.file_id cannot be resolved without an OpenAI Files backend; use file_data or file_url")
+				}
+				return nil, errors.New("input_file.file_data or input_file.file_url is required")
+			}
+			parts = append(parts, map[string]interface{}{"type": "file", "file": file})
+		case "input_audio":
+			audio, _ := part["input_audio"].(map[string]interface{})
+			if len(audio) == 0 {
+				audio = copyInterfaceMap(part)
+				delete(audio, "type")
+			}
+			if audio["data"] == nil {
+				return nil, errors.New("input_audio.data is required")
+			}
+			parts = append(parts, map[string]interface{}{"type": "input_audio", "input_audio": audio})
 		default:
 			return nil, fmt.Errorf("content part type %q is not supported", partType)
 		}
@@ -634,52 +889,87 @@ func responseUsage(req model.ChatCompletionRequest, result *proxy.CallResult) (m
 	return converted, estimated
 }
 
-func buildResponseOutput(result *proxy.CallResult, toolKinds map[string]string) []map[string]interface{} {
+func buildResponseOutput(result *proxy.CallResult, toolBindings responseToolBindings) []map[string]interface{} {
 	if result == nil {
 		return []map[string]interface{}{}
 	}
 	output := make([]map[string]interface{}, 0, 2+len(result.FunctionCalls))
 	_, reasoning := buildResponseContent(result)
 	if reasoning != "" {
-		output = append(output, responseReasoningItem(reasoning))
+		output = append(output, responseMessageItemWithPhase(reasoning, "completed", "commentary", nil))
 	}
+	output = append(output, responseWebSearchCallItems(result.GroundingMetadata)...)
 	content, _ := buildResponseContent(result)
 	if text, ok := content.(string); ok && text != "" {
-		output = append(output, responseMessageItem(text, "completed"))
+		output = append(output, responseMessageItemWithAnnotations(text, "completed", responseAnnotationsFromGrounding(result.GroundingMetadata)))
 	}
 	for _, call := range dedupeResponseFunctionCalls(result.FunctionCalls) {
-		output = append(output, responseToolCallItem(call, toolKinds[call.Name], "completed"))
+		output = append(output, responseToolCallItem(call, toolBindings[call.Name], "completed"))
 	}
 	return output
 }
 
-func responseMessageItem(text, status string) map[string]interface{} {
+func responseWebSearchCallItems(gm *model.GroundingMetadata) []map[string]interface{} {
+	if gm == nil || len(gm.WebSearchQueries) == 0 {
+		return nil
+	}
+	items := make([]map[string]interface{}, 0, len(gm.WebSearchQueries))
+	for _, query := range gm.WebSearchQueries {
+		if strings.TrimSpace(query) == "" {
+			continue
+		}
+		items = append(items, map[string]interface{}{
+			"id": newResponseObjectID("ws"), "type": "web_search_call", "status": "completed",
+			"action": map[string]interface{}{"type": "search", "query": query},
+		})
+	}
+	return items
+}
+
+func responseMessageItemWithAnnotations(text, status string, annotations []map[string]interface{}) map[string]interface{} {
+	return responseMessageItemWithPhase(text, status, "final_answer", annotations)
+}
+
+func responseMessageItemWithPhase(text, status, phase string, annotations []map[string]interface{}) map[string]interface{} {
+	if annotations == nil {
+		annotations = []map[string]interface{}{}
+	}
 	return map[string]interface{}{
 		"id":     newResponseObjectID("msg"),
 		"type":   "message",
 		"status": status,
 		"role":   "assistant",
-		"phase":  "final_answer",
+		"phase":  phase,
 		"content": []map[string]interface{}{{
-			"type": "output_text", "text": text, "annotations": []interface{}{}, "logprobs": []interface{}{},
+			"type": "output_text", "text": text, "annotations": annotations, "logprobs": []interface{}{},
 		}},
 	}
 }
 
-func responseReasoningItem(reasoning string) map[string]interface{} {
-	return map[string]interface{}{
-		"id":   newResponseObjectID("rs"),
-		"type": "reasoning",
-		"summary": []map[string]interface{}{{
-			"type": "summary_text", "text": reasoning,
-		}},
+func responseAnnotationsFromGrounding(gm *model.GroundingMetadata) []map[string]interface{} {
+	chatAnnotations := openAIAnnotationsFromGrounding(gm)
+	annotations := make([]map[string]interface{}, 0, len(chatAnnotations))
+	for _, annotation := range chatAnnotations {
+		if annotation.URLCitation == nil {
+			continue
+		}
+		citation := annotation.URLCitation
+		annotations = append(annotations, map[string]interface{}{
+			"type": "url_citation", "start_index": citation.StartIndex, "end_index": citation.EndIndex,
+			"url": citation.URL, "title": citation.Title,
+		})
 	}
+	return annotations
 }
 
-func responseToolCallItem(call model.FunctionCall, kind, status string) map[string]interface{} {
+func responseToolCallItem(call model.FunctionCall, binding responseToolBinding, status string) map[string]interface{} {
 	arguments := responseStringOrJSON(call.Args)
 	callID := openAIToolCallID(call, 0)
-	switch kind {
+	name := call.Name
+	if binding.Name != "" {
+		name = binding.Name
+	}
+	switch binding.Kind {
 	case "custom":
 		input := arguments
 		if value, ok := call.Args["input"].(string); ok {
@@ -687,7 +977,7 @@ func responseToolCallItem(call model.FunctionCall, kind, status string) map[stri
 		}
 		return map[string]interface{}{
 			"id": newResponseObjectID("ctc"), "type": "custom_tool_call", "status": status,
-			"call_id": callID, "name": call.Name, "input": input,
+			"call_id": callID, "name": name, "input": input,
 		}
 	case "local_shell":
 		return map[string]interface{}{
@@ -705,10 +995,14 @@ func responseToolCallItem(call model.FunctionCall, kind, status string) map[stri
 			"call_id": callID, "operation": applyPatchOperation(call.Args),
 		}
 	default:
-		return map[string]interface{}{
+		item := map[string]interface{}{
 			"id": newResponseObjectID("fc"), "type": "function_call", "status": status,
-			"call_id": callID, "name": call.Name, "arguments": arguments,
+			"call_id": callID, "name": name, "arguments": arguments,
 		}
+		if binding.Namespace != "" {
+			item["namespace"] = binding.Namespace
+		}
+		return item
 	}
 }
 
@@ -889,7 +1183,7 @@ func retainLatestResponseTurn(messages []model.ChatMessage) []model.ChatMessage 
 
 func (api *ResponsesAPI) compactMessages(ctx context.Context, modelName string, messages []model.ChatMessage) (string, model.ChatCompletionRequest, *proxy.CallResult, error) {
 	if api.vp == nil {
-		return "", model.ChatCompletionRequest{}, nil, errors.New("Vertex proxy is unavailable")
+		return "", model.ChatCompletionRequest{}, nil, errors.New("vertex proxy is unavailable")
 	}
 	summaryMessages := append([]model.ChatMessage(nil), messages...)
 	summaryMessages = append(summaryMessages, model.ChatMessage{Role: "user", Content: strings.TrimSpace(`Create a dense conversation-state checkpoint for another model that will continue this exact task.
@@ -993,7 +1287,7 @@ func (api *ResponsesAPI) streamResponse(
 	req model.ResponseRequest,
 	chatReq model.ChatCompletionRequest,
 	compactItem map[string]interface{},
-	toolKinds map[string]string,
+	toolBindings responseToolBindings,
 	stream func(context.Context, func(*proxy.CallResult) error) error,
 ) {
 	setSSEHeaders(w)
@@ -1026,9 +1320,47 @@ func (api *ResponsesAPI) streamResponse(
 	}
 
 	aggregate := &proxy.CallResult{}
+	commentaryID := ""
+	commentaryIndex := -1
+	var commentaryBuilder strings.Builder
 	messageID := newResponseObjectID("msg")
 	messageIndex := -1
 	var textBuilder strings.Builder
+	finishCommentary := func() error {
+		if commentaryIndex < 0 {
+			return nil
+		}
+		text := commentaryBuilder.String()
+		part := map[string]interface{}{
+			"type": "output_text", "text": text, "annotations": []interface{}{}, "logprobs": []interface{}{},
+		}
+		item := map[string]interface{}{
+			"id": commentaryID, "type": "message", "status": "completed", "role": "assistant", "phase": "commentary",
+			"content": []map[string]interface{}{part},
+		}
+		if err := writeEvent(map[string]interface{}{
+			"type": "response.output_text.done", "item_id": commentaryID,
+			"output_index": commentaryIndex, "content_index": 0, "text": text,
+		}); err != nil {
+			return err
+		}
+		if err := writeEvent(map[string]interface{}{
+			"type": "response.content_part.done", "item_id": commentaryID,
+			"output_index": commentaryIndex, "content_index": 0, "part": part,
+		}); err != nil {
+			return err
+		}
+		if err := writeEvent(map[string]interface{}{
+			"type": "response.output_item.done", "output_index": commentaryIndex, "item": item,
+		}); err != nil {
+			return err
+		}
+		output[commentaryIndex] = item
+		commentaryID = ""
+		commentaryIndex = -1
+		commentaryBuilder.Reset()
+		return nil
+	}
 	ctx := r.Context()
 	err := stream(ctx, func(result *proxy.CallResult) error {
 		if err := ctx.Err(); err != nil {
@@ -1038,8 +1370,45 @@ func (api *ResponsesAPI) streamResponse(
 			return nil
 		}
 		accumulateCallResult(aggregate, result)
-		content, _ := buildStreamResponseContent(result)
+		content, reasoning := buildStreamResponseContent(result)
+		if reasoning != "" {
+			if commentaryIndex < 0 {
+				commentaryID = newResponseObjectID("msg")
+				commentaryIndex = len(output)
+				item := map[string]interface{}{
+					"id": commentaryID, "type": "message", "status": "in_progress", "role": "assistant", "phase": "commentary",
+					"content": []interface{}{},
+				}
+				if err := writeEvent(map[string]interface{}{
+					"type": "response.output_item.added", "output_index": commentaryIndex, "item": item,
+				}); err != nil {
+					return err
+				}
+				part := map[string]interface{}{
+					"type": "output_text", "text": "", "annotations": []interface{}{}, "logprobs": []interface{}{},
+				}
+				if err := writeEvent(map[string]interface{}{
+					"type": "response.content_part.added", "item_id": commentaryID,
+					"output_index": commentaryIndex, "content_index": 0, "part": part,
+				}); err != nil {
+					return err
+				}
+				output = append(output, item)
+			}
+			commentaryBuilder.WriteString(reasoning)
+			if err := writeEvent(map[string]interface{}{
+				"type": "response.output_text.delta", "item_id": commentaryID,
+				"output_index": commentaryIndex, "content_index": 0, "delta": reasoning,
+			}); err != nil {
+				return err
+			}
+		}
 		text, _ := content.(string)
+		if (text != "" || len(result.FunctionCalls) > 0) && commentaryIndex >= 0 {
+			if err := finishCommentary(); err != nil {
+				return err
+			}
+		}
 		if text == "" {
 			return nil
 		}
@@ -1057,6 +1426,7 @@ func (api *ResponsesAPI) streamResponse(
 			}); err != nil {
 				return err
 			}
+			output = append(output, item)
 		}
 		textBuilder.WriteString(text)
 		return writeEvent(map[string]interface{}{
@@ -1067,16 +1437,31 @@ func (api *ResponsesAPI) streamResponse(
 		if requestContextCanceled(ctx, err) {
 			return
 		}
-		log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("Vertex Responses stream failed")
+		if !proxy.IsUpstreamErrorLogged(err) {
+			log.Error().Str("err", upstreamLogError(api.vp, err)).Str("model", req.Model).Msg("OpenAI Responses stream failed")
+		}
 		_ = writeEvent(map[string]interface{}{
-			"type": "error", "code": openAIErrorType(proxy.HTTPStatusForError(err)), "message": publicServerErrorMessageFor(err), "param": nil,
+			"type": "error", "code": openAIErrorType(proxy.HTTPStatusForError(err)), "message": publicUpstreamErrorMessage(api.vp, err), "param": nil,
 		})
+		return
+	}
+	if err := finishCommentary(); err != nil {
 		return
 	}
 
 	if messageIndex >= 0 {
 		text := textBuilder.String()
-		part := map[string]interface{}{"type": "output_text", "text": text, "annotations": []interface{}{}, "logprobs": []interface{}{}}
+		annotations := responseAnnotationsFromGrounding(aggregate.GroundingMetadata)
+		for annotationIndex, annotation := range annotations {
+			if err := writeEvent(map[string]interface{}{
+				"type": "response.output_text.annotation.added", "item_id": messageID,
+				"output_index": messageIndex, "content_index": 0, "annotation_index": annotationIndex,
+				"annotation": annotation,
+			}); err != nil {
+				return
+			}
+		}
+		part := map[string]interface{}{"type": "output_text", "text": text, "annotations": annotations, "logprobs": []interface{}{}}
 		item := map[string]interface{}{
 			"id": messageID, "type": "message", "status": "completed", "role": "assistant", "phase": "final_answer", "content": []map[string]interface{}{part},
 		}
@@ -1093,25 +1478,12 @@ func (api *ResponsesAPI) streamResponse(
 		if err := writeEvent(map[string]interface{}{"type": "response.output_item.done", "output_index": messageIndex, "item": item}); err != nil {
 			return
 		}
-		output = append(output, item)
-	}
-
-	_, reasoning := buildResponseContent(aggregate)
-	if reasoning != "" {
-		item := responseReasoningItem(reasoning)
-		index := len(output)
-		if err := writeEvent(map[string]interface{}{"type": "response.output_item.added", "output_index": index, "item": item}); err != nil {
-			return
-		}
-		if err := writeEvent(map[string]interface{}{"type": "response.output_item.done", "output_index": index, "item": item}); err != nil {
-			return
-		}
-		output = append(output, item)
+		output[messageIndex] = item
 	}
 
 	for _, call := range dedupeResponseFunctionCalls(aggregate.FunctionCalls) {
 		index := len(output)
-		doneItem := responseToolCallItem(call, toolKinds[call.Name], "completed")
+		doneItem := responseToolCallItem(call, toolBindings[call.Name], "completed")
 		addedItem := copyInterfaceMap(doneItem)
 		addedItem["status"] = "in_progress"
 		if err := writeEvent(map[string]interface{}{"type": "response.output_item.added", "output_index": index, "item": addedItem}); err != nil {
@@ -1120,13 +1492,14 @@ func (api *ResponsesAPI) streamResponse(
 		switch doneItem["type"] {
 		case "function_call":
 			arguments, _ := doneItem["arguments"].(string)
+			name, _ := doneItem["name"].(string)
 			if err := writeEvent(map[string]interface{}{
 				"type": "response.function_call_arguments.delta", "item_id": doneItem["id"], "output_index": index, "delta": arguments,
 			}); err != nil {
 				return
 			}
 			if err := writeEvent(map[string]interface{}{
-				"type": "response.function_call_arguments.done", "item_id": doneItem["id"], "output_index": index, "arguments": arguments,
+				"type": "response.function_call_arguments.done", "item_id": doneItem["id"], "output_index": index, "name": name, "arguments": arguments,
 			}); err != nil {
 				return
 			}
@@ -1149,7 +1522,33 @@ func (api *ResponsesAPI) streamResponse(
 		output = append(output, doneItem)
 	}
 
+	for _, searchCall := range responseWebSearchCallItems(aggregate.GroundingMetadata) {
+		index := len(output)
+		added := copyInterfaceMap(searchCall)
+		added["status"] = "in_progress"
+		if err := writeEvent(map[string]interface{}{"type": "response.output_item.added", "output_index": index, "item": added}); err != nil {
+			return
+		}
+		if err := writeEvent(map[string]interface{}{"type": "response.output_item.done", "output_index": index, "item": searchCall}); err != nil {
+			return
+		}
+		output = append(output, searchCall)
+	}
+
 	usage, _ := responseUsage(chatReq, aggregate)
+	if len(buildResponseOutput(aggregate, toolBindings)) == 0 {
+		log.Error().
+			Str("model", req.Model).
+			Str("finish_reason", aggregate.FinishReason).
+			Msg("OpenAI Responses stream completed without assistant output")
+		failed := buildResponseObject(req, responseID, "failed", output, &usage)
+		failed["error"] = map[string]interface{}{
+			"code":    "server_error",
+			"message": proxy.ErrNoAssistantOutput.Error(),
+		}
+		_ = writeEvent(map[string]interface{}{"type": "response.failed", "response": failed})
+		return
+	}
 	completed := buildResponseObject(req, responseID, "completed", output, &usage)
 	_ = writeEvent(map[string]interface{}{"type": "response.completed", "response": completed})
 }

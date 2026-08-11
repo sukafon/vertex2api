@@ -13,6 +13,7 @@ type AnthropicMessageRequest struct {
 	Tools         []map[string]interface{} `json:"tools,omitempty"`
 	ToolChoice    interface{}              `json:"tool_choice,omitempty"`
 	Thinking      map[string]interface{}   `json:"thinking,omitempty"`
+	OutputConfig  map[string]interface{}   `json:"output_config,omitempty"`
 }
 
 type AnthropicInputMessage struct {

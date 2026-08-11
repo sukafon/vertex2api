@@ -12,14 +12,29 @@
 
 兼容性须知：
 
-- 将 OpenAI/Anthropic 工具 Schema 归一化为 Gemini 可接受的子集，不修改调用者的原始对象。
-- 保留 Gemini 候选边界、结束原因、工具调用、思考签名和原生候选元数据。
-- Chat Completions 的显式 `reasoning_effort` 会映射到 Gemini 3 `thinkingLevel` 或 Gemini 2.5 `thinkingBudget`；`xhigh` 会静默降级为 Gemini 可表达的 `high`，省略该字段时保留模型默认思考配置，不依据 token 上限自动降级。
+- 内部使用有序 Vertex Part 表示响应，不先压平成文本；原生 Gemini 会保留候选边界、Part 顺序、角色、图片/文件、函数调用与结果、代码执行、思考签名、结束原因、grounding、安全评级和候选元数据。
+- 将 OpenAI/Anthropic 工具 Schema 归一化为 Vertex 可接受的 JSON Schema，不修改调用者的原始对象；协议没有等价字段时采用下表中的显式降级，不伪造另一个供应商的 opaque 数据。
+- Chat Completions 和 Responses 的显式 `reasoning_effort` 会映射到 Gemini 3 `thinkingLevel` 或 Gemini 2.5 `thinkingBudget`；`xhigh`/`max` 会静默降级为 Gemini 可表达的 `high`，省略该字段时保留模型默认思考配置，不依据 token 上限自动降级。Responses 的 `namespace` 工具会展开为 `namespace__tool` 形式的 Vertex 函数声明；响应时恢复为独立的 `namespace` 与子工具 `name` 供 Codex 分派，下一轮输入再无损还原为 Vertex 扁平名。
 - 对 `gemini-3.6-*` 移除末尾 model 预填充，适配该版本不接受 model turn 结尾的请求约束；这不是把内容改写成 `systemInstruction`，其他模型保留原行为。
-- Responses 支持无状态字符串/输入项数组、文本与 data URL 图片、函数工具、custom、local_shell、shell、apply_patch、结构化输出和 SSE 生命周期事件；不实现 `previous_response_id`、后台任务或 OpenAI 托管工具。
+- Responses 支持无状态字符串/输入项数组、文本、data URL/远程图片、内联/远程文件、音频、函数工具、custom、local_shell、shell、apply_patch、Vertex 等价的 `web_search`、`code_interpreter`、`url_context`、结构化输出、refusal、URL citation、web-search call 和完整 SSE 生命周期；不实现 `previous_response_id`、OpenAI Files、后台任务或 `file_search`。
+- Anthropic Messages 支持思考及签名流、工具流、图片、PDF/文本/URL document、`output_config.format` 结构化输出和 `output_config.effort`。Vertex grounding 无法生成 Anthropic web-search citation 所要求的 `encrypted_index`/`encrypted_content`，因此不会伪造 Anthropic citation block。
+- 输入历史包含不完整的并行工具记录时，会按 tool call ID、名称依次配对，只保留真实存在的 function call/response 对并按调用顺序发送给 Vertex；不会为未执行的工具伪造结果。该兼容处理不对不完整历史的来源作归因。
+- 图片接口把 OpenAI `size` 中可精确表达的宽高比映射为 Vertex `imageConfig.aspectRatio`；`quality` 或不可表达的尺寸使用模型默认值，并通过 `X-Vertex2API-Warning` 明示降级。省略模型时使用 `gemini-3-pro-image`。
 - `/v1/responses/compact` 与 `context_management.compact_threshold` 会调用当前 Vertex 模型生成状态检查点，再输出 AES-GCM 认证加密的 opaque compaction item。该 item 只保证由相同 API_KEY 列表配置的 vertex2api 实例解码，不能与 OpenAI 官方 compaction item 互换；修改密钥内容或顺序会使旧 item 失效。无密钥运行时使用进程内随机密钥，重启后旧 item 失效。
 
-每个接口只实现仓库中列出的字段和行为，未列出的字段不会被视为已生效。
+### 转换保真度
+
+| 能力 | Gemini 原生 | OpenAI Chat | OpenAI Responses | Anthropic Messages |
+| --- | --- | --- | --- | --- |
+| 文本、思考、工具调用顺序 | 原样 | 文本/思考分字段，工具调用使用标准字段 | Vertex thought 映射为独立、可流式展示的 Responses `assistant` commentary message；最终文本与工具调用使用独立 item | 使用 thinking/text/tool_use block 与实时 delta |
+| 思考签名 | 原样 | 工具调用 ID 携带 opaque 签名以便回传 | 工具调用 ID 携带 opaque 签名以便回传 | thinking signature 原样；工具调用 ID 携带 opaque 签名 |
+| 图片、文件、音频输入 | 原样 | 映射为 `inlineData`/`fileData` | 映射为 `inlineData`/`fileData` | image/document 映射为 `inlineData`/`fileData` |
+| 图片、文件、代码执行输出 | 原样 | 无标准等价项时转为可见 Markdown/data URL | 无标准等价项时转为可见 `output_text` | 转为协议合法的可见 text block/Markdown data URL |
+| Google Search grounding | 原样 | URL citation annotations | `web_search_call` 与 URL citation annotations | 不伪造缺少 Anthropic opaque 索引的 citation |
+| safety/prompt metadata | 原样 `promptFeedback`/finish reason | `content_filter` | refusal item | `end_turn`（不伪装成 Anthropic 模型的 `refusal`） |
+| usage/cache/thinking token | 原样 metadata | 映射 usage details；缺失时标记估算 | 映射 input/output details；缺失时标记估算 | 映射 cache-read/thinking usage；缺失时标记估算 |
+
+“原样”指该匿名 Vertex GraphQL 上游实际返回或接受的字段；并不代表另一个协议中不存在的服务端资源（例如 OpenAI Files、container ID、持久化 response 或 Anthropic 加密搜索索引）可以被本地伪造。无法等价表达但仍可展示的输出会显式转为可见内容；会改变调用语义的请求字段则返回参数错误或在响应头中给出降级警告。
 
 ## 快速开始
 
@@ -125,12 +140,23 @@ curl http://127.0.0.1:8080/v1/messages \
 | `WRITE_TIMEOUT_SECONDS` | `600` | 下游响应写超时，需覆盖长流式请求 |
 | `AUTO_FETCH_MODELS` | `true` | 启动并定时拉取上游模型目录 |
 | `AUTO_FETCH_CRON` | `0 0,4 * * *` | 标准五段 Cron 表达式 |
-| `REDACT_UPSTREAM_LOGS` | `false` | 是否将上游错误/响应详情替换为 `[REDACTED]` |
+| `REDACT_UPSTREAM_RESPONSES` | `false` | 是否隐藏返回给下游调用方的上游错误详情；服务端日志始终保留真实错误 |
+| `LOG_CODE3_REQUEST_BODIES` | `false` | 是否把首次出现的每种 Vertex Code 3 错误及完整上游请求体写入 `API_KEY_FILE` 所在目录的 `code3_request_bodies.log`；相同错误即使请求体不同也跳过，删除日志后才重新记录 |
 | `RANDOM_FINGERPRINT` | `false` | 是否附加浏览器请求层 Header；TLS ClientHello 由 `TLS_CLIENT_PROFILE` 控制 |
 | `TLS_CLIENT_PROFILE` | `chrome_146` | `tls-client` 浏览器 TLS/HTTP2 profile |
 | `CORS_ALLOW_ORIGIN` | 无 | 浏览器跨域 Origin；默认不授权跨域，谨慎使用 `*` |
 
 上游 reCAPTCHA 和 Vertex 请求默认使用 `tls-client` 的 Chrome profile，模拟 TLS ClientHello、HTTP/2 设置和请求层浏览器特征；`RANDOM_FINGERPRINT=true` 时额外附加请求层 Header。建议保持同一个 `TLS_CLIENT_PROFILE` 稳定使用，不要在每次重试时切换 profile。
+
+`LOG_CODE3_REQUEST_BODIES=true` 仅用于逐项诊断需要人工处理的 Vertex Code 3 错误，不会跳过请求、重试或错误返回；可自动重试的 `Failed to verify action` 不写入该文件。日志采用 JSON Lines 格式，错误消息是去重键：一种错误只保存第一次出现时的请求体，之后即使请求体不同也不再写入；运行中删除 `code3_request_bodies.log` 即可清空去重状态并允许重新捕获。本地默认路径是 `./code3_request_bodies.log`，官方镜像中随默认 `API_KEY_FILE=/data/api-key` 写入持久化卷 `/data/code3_request_bodies.log`。文件包含完整上游请求体，可能含对话内容和临时 reCAPTCHA token，请限制文件访问并在排查后删除。
+
+如果容器名为 `vertex2api`，且启动日志显示 Code 3 文件写在容器工作目录 `/app`，可用以下命令将其导出到宿主机：
+
+```bash
+docker cp vertex2api:/app/code3_request_bodies.log ~/vertex2api/code3_request_bodies.log
+```
+
+`docker cp` 会复制文件，但不会可靠地代替你准备目标父目录；请先确保宿主机的 `~/vertex2api` 已存在。使用官方镜像默认 `API_KEY_FILE=/data/api-key` 时，容器内源路径应改为 `/data/code3_request_bodies.log`。
 
 密钥可通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传递；手动设置的 `API_KEY` 和 `STATS_KEY` 至少需要 16 个字符。未设置 `API_KEY` 时，程序首次启动会生成密钥并写入 `API_KEY_FILE`，后续重启会复用该密钥；生产环境建议手动设置固定密钥，并通过反向代理启用 TLS、限流和访问日志脱敏。
 

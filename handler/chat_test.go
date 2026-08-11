@@ -158,13 +158,15 @@ func TestBuildOpenAIRequestOptionsConvertsToolsAndToolChoice(t *testing.T) {
 	}
 }
 
-func TestBuildOpenAIRequestOptionsTranslatesNativeToolsAndPassesThroughUnknown(t *testing.T) {
+func TestBuildOpenAIRequestOptionsTranslatesNativeTools(t *testing.T) {
 	options := buildOpenAIRequestOptions(model.ChatCompletionRequest{
 		Tools: []map[string]interface{}{
 			{"type": "web_search_preview"},
 			{"type": "code_interpreter"},
 			{"type": "url_context"},
-			{"type": "vendor_tool", "name": "google_search"},
+			{"type": "google_maps"},
+			{"type": "parallel_ai_search"},
+			{"type": "computer_use"},
 		},
 	})
 
@@ -181,12 +183,24 @@ func TestBuildOpenAIRequestOptionsTranslatesNativeToolsAndPassesThroughUnknown(t
 	if _, ok := tools[2].(map[string]interface{})["urlContext"]; !ok {
 		t.Fatal("url_context should translate to urlContext")
 	}
-	unknown := tools[3].(map[string]interface{})
-	if got := unknown["type"]; got != "vendor_tool" {
-		t.Fatalf("unknown tool should pass through, got type %v", got)
+	if _, ok := tools[3].(map[string]interface{})["googleMaps"]; !ok {
+		t.Fatal("google_maps should translate to googleMaps")
 	}
-	if got := unknown["name"]; got != "google_search" {
-		t.Fatalf("unknown tool name should be preserved, got %v", got)
+	if _, ok := tools[4].(map[string]interface{})["parallelAiSearch"]; !ok {
+		t.Fatal("parallel_ai_search should translate to parallelAiSearch")
+	}
+	if _, ok := tools[5].(map[string]interface{})["computerUse"]; !ok {
+		t.Fatal("computer_use should translate to computerUse")
+	}
+}
+
+func TestValidateOpenAIRequestRejectsUnknownToolInsteadOfDroppingIt(t *testing.T) {
+	req := model.ChatCompletionRequest{
+		Model: "gemini-test", Messages: []model.ChatMessage{{Role: "user", Content: "hello"}},
+		Tools: []map[string]interface{}{{"type": "vendor_tool"}},
+	}
+	if got := validateOpenAIRequest(req); !strings.Contains(got, "no Vertex equivalent") {
+		t.Fatalf("validation = %q", got)
 	}
 }
 
@@ -297,11 +311,80 @@ func TestStreamResponseUsesRequestContext(t *testing.T) {
 	}
 }
 
+func TestStreamResponseKeepsToolCallsAcrossTrailingFinishMetadata(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+
+	streamResponse(rec, req, "gemini-test", func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+		if err := onChunk(&proxy.CallResult{
+			FunctionCalls: []model.FunctionCall{{Name: "echo", Args: map[string]interface{}{"text": "hello"}}},
+		}); err != nil {
+			return err
+		}
+		return onChunk(&proxy.CallResult{FinishReason: "SAFETY"})
+	})
+
+	objects := decodeStreamDataObjects(t, rec.Body.String())
+	if len(objects) == 0 {
+		t.Fatal("stream should contain response chunks")
+	}
+	choices, ok := objects[len(objects)-1]["choices"].([]interface{})
+	if !ok || len(choices) != 1 {
+		t.Fatalf("final chunk choices = %v, want one choice", objects[len(objects)-1]["choices"])
+	}
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("final choice type = %T, want object", choices[0])
+	}
+	if got, want := choice["finish_reason"], "tool_calls"; got != want {
+		t.Fatalf("final finish_reason = %v, want %q; body=%s", got, want, rec.Body.String())
+	}
+}
+
+func TestOpenAIFinishReasonDoesNotInferContentFilter(t *testing.T) {
+	result := &proxy.CallResult{
+		FinishReason:   "SAFETY",
+		PromptFeedback: map[string]interface{}{"blockReason": "SAFETY", "blockReasonMessage": "blocked"},
+	}
+	if got := openAIFinishReason(result); got != "stop" {
+		t.Fatalf("finish reason = %q, want stop", got)
+	}
+}
+
+func TestStreamResponseIgnoresUnspecifiedPromptFeedback(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+
+	streamResponse(rec, req, "gemini-test", func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+		return onChunk(&proxy.CallResult{
+			TextParts:      []model.TextPart{{Text: "complete answer"}},
+			FinishReason:   "STOP",
+			PromptFeedback: map[string]interface{}{"blockReason": "BLOCKED_REASON_UNSPECIFIED"},
+		})
+	})
+
+	objects := decodeStreamDataObjects(t, rec.Body.String())
+	if len(objects) == 0 {
+		t.Fatal("stream should contain response chunks")
+	}
+	choices, ok := objects[len(objects)-1]["choices"].([]interface{})
+	if !ok || len(choices) != 1 {
+		t.Fatalf("final chunk choices = %v, want one choice", objects[len(objects)-1]["choices"])
+	}
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("final choice type = %T, want object", choices[0])
+	}
+	if got, want := choice["finish_reason"], "stop"; got != want {
+		t.Fatalf("final finish_reason = %v, want %q; body=%s", got, want, rec.Body.String())
+	}
+}
+
 func TestWriteOpenAIStreamErrorPassthroughUpstreamMessage(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	errMsg := "api error (code 5): model not found"
-	if err := writeOpenAIStreamError(rec, errors.New(errMsg)); err != nil {
+	if err := writeOpenAIStreamError(rec, nil, errors.New(errMsg)); err != nil {
 		t.Fatalf("writeOpenAIStreamError returned error: %v", err)
 	}
 
@@ -315,7 +398,7 @@ func TestWriteOpenAIStreamErrorPreservesGenerationFinishReason(t *testing.T) {
 	rec := httptest.NewRecorder()
 	message := "generation failed: finishReason=SAFETY"
 
-	if err := writeOpenAIStreamError(rec, errors.New(message)); err != nil {
+	if err := writeOpenAIStreamError(rec, nil, errors.New(message)); err != nil {
 		t.Fatalf("writeOpenAIStreamError returned error: %v", err)
 	}
 
@@ -531,12 +614,14 @@ func TestOpenAIReasoningConfigMapsExplicitEffort(t *testing.T) {
 	}{
 		{name: "Gemini 3.6 minimal", modelName: "gemini-3.6-flash", effort: "minimal", key: "thinkingLevel", want: "MINIMAL"},
 		{name: "Gemini 3.6 xhigh degrades to high", modelName: "gemini-3.6-flash", effort: "xhigh", key: "thinkingLevel", want: "HIGH"},
+		{name: "Gemini 3.6 max degrades to high", modelName: "gemini-3.6-flash", effort: "max", key: "thinkingLevel", want: "HIGH"},
 		{name: "Gemini 3 medium", modelName: "gemini-3-flash-preview", effort: "medium", key: "thinkingLevel", want: "MEDIUM"},
 		{name: "Gemini 3 Pro promotes minimal", modelName: "gemini-3.1-pro-preview", effort: "minimal", key: "thinkingLevel", want: "LOW"},
 		{name: "Gemini 2.5 low", modelName: "gemini-2.5-flash", effort: "low", key: "thinkingBudget", want: 1024},
 		{name: "Gemini 2.5 medium", modelName: "gemini-2.5-flash", effort: "medium", key: "thinkingBudget", want: 8192},
 		{name: "Gemini 2.5 high", modelName: "gemini-2.5-flash", effort: "high", key: "thinkingBudget", want: 24576},
 		{name: "Gemini 2.5 xhigh degrades to high", modelName: "gemini-2.5-flash", effort: "xhigh", key: "thinkingBudget", want: 24576},
+		{name: "Gemini 2.5 max degrades to high", modelName: "gemini-2.5-flash", effort: "max", key: "thinkingBudget", want: 24576},
 		{name: "Gemini 2.5 disables thinking", modelName: "gemini-2.5-flash", effort: "none", key: "thinkingBudget", want: 0},
 	}
 
@@ -568,7 +653,7 @@ func TestOpenAIReasoningEffortValidation(t *testing.T) {
 	}{
 		{modelName: "gemini-3.6-flash", effort: "none"},
 		{modelName: "gemini-2.5-pro", effort: "none"},
-		{modelName: "gemini-3.6-flash", effort: "max"},
+		{modelName: "gemini-3.6-flash", effort: "ultra"},
 		{modelName: "gemini-2.0-flash", effort: "high"},
 	}
 	for _, tt := range tests {
@@ -586,5 +671,39 @@ func TestValidateOpenAIRequestRejectsUnsupportedMessageRole(t *testing.T) {
 	}
 	if got := validateOpenAIRequest(req); got == "" {
 		t.Fatal("legacy function role should be rejected")
+	}
+}
+
+func TestBuildResponseContentKeepsThoughtOutOfImageMarkdown(t *testing.T) {
+	result := &proxy.CallResult{Parts: []model.VertexPart{
+		{Text: "private reasoning", Thought: true},
+		{Text: "visible answer"},
+		{InlineData: &model.InlineData{MimeType: "image/png", Data: "aW1n"}},
+	}}
+	content, reasoning := buildResponseContent(result)
+	text, _ := content.(string)
+	if reasoning != "private reasoning" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+	if strings.Contains(text, "private reasoning") || !strings.Contains(text, "visible answer") || !strings.Contains(text, "data:image/png;base64,aW1n") {
+		t.Fatalf("visible content = %q", text)
+	}
+}
+
+func TestConvertContentToPartsPreservesRemoteImageAndFiles(t *testing.T) {
+	parts := convertContentToParts([]interface{}{
+		map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": "https://example.com/a.png"}},
+		map[string]interface{}{"type": "file", "file": map[string]interface{}{"file_data": "data:application/pdf;base64,cGRm"}},
+	})
+	if len(parts) != 2 {
+		t.Fatalf("parts = %#v", parts)
+	}
+	remote, _ := parts[0]["fileData"].(map[string]interface{})
+	if remote["fileUri"] != "https://example.com/a.png" {
+		t.Fatalf("remote image part = %#v", parts[0])
+	}
+	inline, _ := parts[1]["inlineData"].(map[string]interface{})
+	if inline["mimeType"] != "application/pdf" || inline["data"] != "cGRm" {
+		t.Fatalf("inline file part = %#v", parts[1])
 	}
 }

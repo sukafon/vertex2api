@@ -203,3 +203,39 @@ func TestBuildGeminiResponseIncludesGroundingMetadata(t *testing.T) {
 		t.Fatalf("unexpected grounding metadata content: %+v", gotGM)
 	}
 }
+
+func TestGeminiGenerateRejectsModelArmorWithSafetySettings(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/models/gemini-test:generateContent", strings.NewReader(`{
+		"contents":[{"role":"user","parts":[{"text":"hello"}]}],
+		"modelArmorConfig":{},
+		"safetySettings":[{"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"OFF"}]
+	}`))
+	req.SetPathValue("modelAction", "gemini-test:generateContent")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	GeminiGenerate(nil, true).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "cannot be used together") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBuildGeminiResponsePreservesOrderedNativeParts(t *testing.T) {
+	result := &proxy.CallResult{Role: "model", Parts: []model.VertexPart{
+		{Text: "before"},
+		{FunctionCall: &model.FunctionCall{ID: "c1", Name: "lookup", Args: map[string]interface{}{"q": "x"}}, ThoughtSignature: "sig"},
+		{Text: "after"},
+		{ExecutableCode: map[string]interface{}{"language": "PYTHON", "code": "print(1)"}},
+		{CodeExecutionResult: map[string]interface{}{"outcome": "OUTCOME_OK", "output": "1"}},
+		{FileData: map[string]interface{}{"fileUri": "gs://bucket/a.pdf", "mimeType": "application/pdf"}},
+	}}
+	response := buildGeminiResponse(result)
+	candidates := response["candidates"].([]map[string]interface{})
+	content := candidates[0]["content"].(map[string]interface{})
+	parts := content["parts"].([]map[string]interface{})
+	if len(parts) != 6 || parts[0]["text"] != "before" || parts[1]["functionCall"] == nil || parts[2]["text"] != "after" || parts[3]["executableCode"] == nil || parts[4]["codeExecutionResult"] == nil || parts[5]["fileData"] == nil {
+		t.Fatalf("native parts were reordered or dropped: %#v", parts)
+	}
+	if got := parts[1]["thoughtSignature"]; got != "sig" {
+		t.Fatalf("thoughtSignature = %v", got)
+	}
+}

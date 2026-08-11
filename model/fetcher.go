@@ -250,7 +250,7 @@ func StartAutoFetcher(ctx context.Context, httpClient *client.HTTPClient, cfg *c
 	log.Info().Str("cron", cronExpr).Msg("Auto-fetch upstream models is enabled. Triggering initial fetch...")
 	go func() {
 		if _, err := UpdateCatalogFromUpstream(ctx, httpClient, cfg.VertexBaseURL, cfg.GraphQLAPIKey); err != nil && ctx.Err() == nil {
-			log.Error().Str("err", config.UpstreamLogError(err, cfg.RedactUpstreamLogs, 512)).Msg("Initial auto-fetch of upstream models failed, keeping default in-memory catalog unchanged without retry")
+			log.Error().Str("err", config.UpstreamLogError(err, false, 512)).Msg("Initial auto-fetch of upstream models failed, keeping default in-memory catalog unchanged without retry")
 		}
 
 		for {
@@ -273,7 +273,7 @@ func StartAutoFetcher(ctx context.Context, httpClient *client.HTTPClient, cfg *c
 			case <-timer.C:
 				log.Info().Msg("Running scheduled upstream model fetch...")
 				if _, err := UpdateCatalogFromUpstream(ctx, httpClient, cfg.VertexBaseURL, cfg.GraphQLAPIKey); err != nil && ctx.Err() == nil {
-					log.Error().Str("err", config.UpstreamLogError(err, cfg.RedactUpstreamLogs, 512)).Msg("Scheduled auto-fetch of upstream models failed, keeping existing in-memory catalog unchanged without retry")
+					log.Error().Str("err", config.UpstreamLogError(err, false, 512)).Msg("Scheduled auto-fetch of upstream models failed, keeping existing in-memory catalog unchanged without retry")
 				}
 			}
 		}

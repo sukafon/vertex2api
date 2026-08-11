@@ -26,6 +26,7 @@ const (
 
 func AnthropicMessages(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerAnthropicMessages))
 		var req model.AnthropicMessageRequest
 		_, ok := readAnthropicJSONRequest(w, r, &req)
 		if !ok {
@@ -55,8 +56,10 @@ func AnthropicMessages(vp *proxy.VertexProxy, allowCustomModelNames bool) http.H
 				log.Debug().Err(err).Str("model", req.Model).Msg("Anthropic request canceled")
 				return
 			}
-			log.Error().Str("err", vp.UpstreamLogError(err)).Str("model", req.Model).Msg("Vertex API call for Anthropic failed")
-			writeUpstreamProtocolError(w, r, err)
+			if !proxy.IsUpstreamErrorLogged(err) {
+				log.Error().Str("err", vp.UpstreamLogError(err)).Str("model", req.Model).Msg("Anthropic Messages call failed")
+			}
+			writeUpstreamProtocolError(w, r, vp, err)
 			return
 		}
 
@@ -87,6 +90,39 @@ func validateAnthropicRequest(req model.AnthropicMessageRequest) string {
 		role := strings.ToLower(strings.TrimSpace(message.Role))
 		if role != "user" && role != "assistant" && role != "system" {
 			return "messages roles must be user, assistant, or system"
+		}
+	}
+	for index, tool := range req.Tools {
+		if _, ok := convertNativeGeminiTool(tool); ok {
+			continue
+		}
+		if name, _ := tool["name"].(string); strings.TrimSpace(name) == "" {
+			toolType, _ := tool["type"].(string)
+			return fmt.Sprintf("tools[%d].type %q has no Vertex equivalent and tools[%d].name is missing", index, toolType, index)
+		}
+	}
+	if rawFormat, exists := req.OutputConfig["format"]; exists {
+		format, _ := rawFormat.(map[string]interface{})
+		if len(format) == 0 {
+			return "output_config.format must be an object"
+		}
+		formatType, _ := format["type"].(string)
+		if formatType != "json_schema" {
+			return "output_config.format.type must be json_schema"
+		}
+		if format["schema"] == nil {
+			return "output_config.format.schema is required"
+		}
+	}
+	if rawEffort, exists := req.OutputConfig["effort"]; exists {
+		effort, ok := rawEffort.(string)
+		if !ok {
+			return "output_config.effort must be a string"
+		}
+		switch strings.ToLower(strings.TrimSpace(effort)) {
+		case "low", "medium", "high", "max":
+		default:
+			return "output_config.effort must be low, medium, high, or max"
 		}
 	}
 	return ""
@@ -219,7 +255,6 @@ func streamAnthropicResponseWithProxy(
 	id := anthropicMessageID()
 	ctx := r.Context()
 	streamState := &anthropicStreamState{w: w, openTextIndex: -1, openThinkingIndex: -1}
-	stopReason := "end_turn"
 	aggregate := &proxy.CallResult{}
 	committed := false
 	err := stream(ctx, func(result *proxy.CallResult) error {
@@ -238,11 +273,6 @@ func streamAnthropicResponseWithProxy(
 			}
 			committed = true
 		}
-		if len(result.FunctionCalls) > 0 {
-			stopReason = "tool_use"
-		} else if result.FinishReason != "" {
-			stopReason = anthropicStopReason(result)
-		}
 		for _, block := range buildAnthropicContent(result) {
 			if err := streamState.writeBlock(block); err != nil {
 				return err
@@ -255,12 +285,14 @@ func streamAnthropicResponseWithProxy(
 			log.Debug().Err(err).Str("model", req.Model).Msg("Anthropic stream client disconnected")
 			return
 		}
-		log.Error().Str("err", upstreamLogError(vp, err)).Str("model", req.Model).Msg("Vertex API stream for Anthropic failed")
+		if !proxy.IsUpstreamErrorLogged(err) {
+			log.Error().Str("err", upstreamLogError(vp, err)).Str("model", req.Model).Msg("Anthropic Messages stream failed")
+		}
 		if !committed {
-			writeUpstreamProtocolError(w, r, err)
+			writeUpstreamProtocolError(w, r, vp, err)
 			return
 		}
-		_ = writeAnthropicStreamError(w, err)
+		_ = writeAnthropicStreamError(w, vp, err)
 		return
 	}
 	if err := ctx.Err(); err != nil {
@@ -278,6 +310,9 @@ func streamAnthropicResponseWithProxy(
 		log.Error().Err(err).Str("model", req.Model).Msg("Anthropic stream content block stop failed")
 		return
 	}
+	// The Anthropic message terminator is emitted only after Vertex reaches EOF;
+	// an earlier finishReason does not terminate the upstream stream.
+	stopReason := anthropicStopReason(aggregate)
 	finalUsage, _ := anthropicUsage(req, aggregate)
 	if err := writeAnthropicMessageDeltaWithUsage(w, stopReason, finalUsage); err != nil {
 		log.Error().Err(err).Str("model", req.Model).Msg("Anthropic stream message_delta failed")
@@ -418,6 +453,8 @@ func (s *anthropicStreamState) closeOpenBlocks() error {
 		}); err != nil {
 			return err
 		}
+		s.seenThinking = ""
+		s.emittedSignature = false
 	}
 	if s.openTextIndex >= 0 {
 		index := s.openTextIndex
@@ -428,6 +465,7 @@ func (s *anthropicStreamState) closeOpenBlocks() error {
 		}); err != nil {
 			return err
 		}
+		s.seenText = ""
 	}
 	return nil
 }
@@ -789,6 +827,8 @@ func convertAnthropicContentToParts(modelName string, content interface{}, role 
 				if part := anthropicImagePart(block); part != nil {
 					parts = append(parts, part)
 				}
+			case "document":
+				parts = append(parts, anthropicDocumentParts(block)...)
 			case "tool_use", "server_tool_use":
 				if part := anthropicToolUsePart(modelName, block, toolCallNames); part != nil {
 					parts = append(parts, part)
@@ -820,6 +860,16 @@ func anthropicImagePart(block map[string]interface{}) map[string]interface{} {
 	}
 
 	sourceType, _ := source["type"].(string)
+	if sourceType == "url" {
+		uri, _ := source["url"].(string)
+		if uri == "" {
+			return nil
+		}
+		mimeType, _ := source["media_type"].(string)
+		return map[string]interface{}{
+			"fileData": map[string]interface{}{"fileUri": uri, "mimeType": mimeType},
+		}
+	}
 	if sourceType != "base64" {
 		return nil
 	}
@@ -837,6 +887,73 @@ func anthropicImagePart(block map[string]interface{}) map[string]interface{} {
 			"data":     data,
 		},
 	}
+}
+
+func anthropicDocumentParts(block map[string]interface{}) []map[string]interface{} {
+	source, ok := block["source"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	sourceType, _ := source["type"].(string)
+	switch sourceType {
+	case "base64":
+		data, _ := source["data"].(string)
+		if data == "" {
+			return nil
+		}
+		mimeType, _ := source["media_type"].(string)
+		if mimeType == "" {
+			mimeType = "application/pdf"
+		}
+		return []map[string]interface{}{{"inlineData": map[string]interface{}{"mimeType": mimeType, "data": data}}}
+	case "url":
+		uri, _ := source["url"].(string)
+		if uri == "" {
+			return nil
+		}
+		mimeType, _ := source["media_type"].(string)
+		return []map[string]interface{}{{"fileData": map[string]interface{}{"fileUri": uri, "mimeType": mimeType}}}
+	case "text":
+		data, _ := source["data"].(string)
+		if data == "" {
+			return nil
+		}
+		return []map[string]interface{}{{"text": anthropicDocumentText(block, data)}}
+	case "content":
+		content, _ := source["content"].([]interface{})
+		var text strings.Builder
+		for _, raw := range content {
+			item, _ := raw.(map[string]interface{})
+			if value, _ := item["text"].(string); value != "" {
+				if text.Len() > 0 {
+					text.WriteString("\n\n")
+				}
+				text.WriteString(value)
+			}
+		}
+		if text.Len() == 0 {
+			return nil
+		}
+		return []map[string]interface{}{{"text": anthropicDocumentText(block, text.String())}}
+	default:
+		return nil
+	}
+}
+
+func anthropicDocumentText(block map[string]interface{}, data string) string {
+	var builder strings.Builder
+	if title, _ := block["title"].(string); title != "" {
+		builder.WriteString("Document title: ")
+		builder.WriteString(title)
+		builder.WriteByte('\n')
+	}
+	if contextText, _ := block["context"].(string); contextText != "" {
+		builder.WriteString("Document context: ")
+		builder.WriteString(contextText)
+		builder.WriteByte('\n')
+	}
+	builder.WriteString(data)
+	return builder.String()
 }
 
 func anthropicToolUsePart(modelName string, block map[string]interface{}, toolCallNames map[string]string) map[string]interface{} {
@@ -958,6 +1075,18 @@ func buildAnthropicGenerationConfig(req model.AnthropicMessageRequest) map[strin
 	}
 	if thinkingConfig := convertAnthropicThinking(req.Thinking); thinkingConfig != nil {
 		genConfig["thinkingConfig"] = thinkingConfig
+	} else if effort, _ := req.OutputConfig["effort"].(string); effort != "" {
+		if strings.EqualFold(effort, "max") {
+			effort = "xhigh"
+		}
+		if thinkingConfig := openAIReasoningConfig(req.Model, &effort); thinkingConfig != nil {
+			thinkingConfig["includeThoughts"] = true
+			genConfig["thinkingConfig"] = thinkingConfig
+		}
+	}
+	if format, _ := req.OutputConfig["format"].(map[string]interface{}); len(format) > 0 {
+		genConfig["responseMimeType"] = "application/json"
+		genConfig["responseJsonSchema"] = schemanorm.Normalize(format["schema"])
 	}
 	return genConfig
 }
@@ -1087,6 +1216,10 @@ func buildAnthropicContent(result *proxy.CallResult) []map[string]interface{} {
 		return []map[string]interface{}{}
 	}
 
+	if len(result.Parts) > 0 {
+		return buildAnthropicOrderedContent(result.Parts)
+	}
+
 	var content []map[string]interface{}
 	var text strings.Builder
 	for _, part := range result.TextParts {
@@ -1110,12 +1243,7 @@ func buildAnthropicContent(result *proxy.CallResult) []map[string]interface{} {
 
 	for _, img := range result.ImageParts {
 		content = append(content, map[string]interface{}{
-			"type": "image",
-			"source": map[string]interface{}{
-				"type":       "base64",
-				"media_type": img.MimeType,
-				"data":       img.Data,
-			},
+			"type": "text", "text": "![generated image](" + imageDataURL(img) + ")",
 		})
 	}
 
@@ -1132,6 +1260,75 @@ func buildAnthropicContent(result *proxy.CallResult) []map[string]interface{} {
 		content = append(content, block)
 	}
 
+	return content
+}
+
+func buildAnthropicOrderedContent(parts []model.VertexPart) []map[string]interface{} {
+	content := make([]map[string]interface{}, 0, len(parts))
+	var text strings.Builder
+	flushText := func() {
+		if text.Len() == 0 {
+			return
+		}
+		content = append(content, map[string]interface{}{"type": "text", "text": text.String()})
+		text.Reset()
+	}
+	toolIndex := 0
+	for _, part := range parts {
+		switch {
+		case part.Text == "" && part.ThoughtSignature != "" && part.FunctionCall == nil:
+			flushText()
+			last := len(content) - 1
+			if last >= 0 && content[last]["type"] == "thinking" {
+				content[last]["signature"] = part.ThoughtSignature
+			} else if part.Thought {
+				// Vertex may stream the signature as its own empty thought Part.
+				// Keeping an empty block lets the stream state attach the
+				// signature_delta to the currently open thinking block.
+				content = append(content, map[string]interface{}{
+					"type": "thinking", "thinking": "", "signature": part.ThoughtSignature,
+				})
+			}
+		case part.Text != "" && part.Thought:
+			flushText()
+			block := map[string]interface{}{"type": "thinking", "thinking": part.Text}
+			if part.ThoughtSignature != "" {
+				block["signature"] = part.ThoughtSignature
+			}
+			content = append(content, block)
+		case part.Text != "":
+			text.WriteString(part.Text)
+		case part.InlineData != nil && part.InlineData.Data != "":
+			appendMarkdownSeparator(&text)
+			text.WriteString("![generated image](")
+			text.WriteString(imageDataURL(*part.InlineData))
+			text.WriteString(")")
+		case part.FunctionCall != nil && part.FunctionCall.Name != "":
+			flushText()
+			call := *part.FunctionCall
+			call.ThoughtSignature = part.ThoughtSignature
+			input := call.Args
+			if input == nil {
+				input = map[string]interface{}{}
+			}
+			content = append(content, map[string]interface{}{
+				"type": "tool_use", "id": anthropicToolUseID(call, toolIndex), "name": call.Name, "input": input,
+			})
+			toolIndex++
+		case len(part.ExecutableCode) > 0:
+			appendExecutableCodeMarkdown(&text, part.ExecutableCode)
+		case len(part.CodeExecutionResult) > 0:
+			appendCodeExecutionResultMarkdown(&text, part.CodeExecutionResult)
+		case len(part.FileData) > 0:
+			if uri, _ := part.FileData["fileUri"].(string); uri != "" {
+				appendMarkdownSeparator(&text)
+				text.WriteString("[file](")
+				text.WriteString(uri)
+				text.WriteString(")")
+			}
+		}
+	}
+	flushText()
 	return content
 }
 
@@ -1168,7 +1365,7 @@ func anthropicToolSignatureFromID(id string) string {
 }
 
 func anthropicStopReason(result *proxy.CallResult) string {
-	if result != nil && len(result.FunctionCalls) > 0 {
+	if anthropicResultHasToolUse(result) {
 		return "tool_use"
 	}
 	if result == nil {
@@ -1180,6 +1377,21 @@ func anthropicStopReason(result *proxy.CallResult) string {
 	default:
 		return "end_turn"
 	}
+}
+
+func anthropicResultHasToolUse(result *proxy.CallResult) bool {
+	if result == nil {
+		return false
+	}
+	if len(result.FunctionCalls) > 0 {
+		return true
+	}
+	for _, part := range result.Parts {
+		if part.FunctionCall != nil && part.FunctionCall.Name != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func writeAnthropicMessageStart(w http.ResponseWriter, id, modelName string, usage *model.AnthropicUsage) error {
@@ -1258,13 +1470,13 @@ func writeAnthropicMessageDeltaWithUsage(w http.ResponseWriter, stopReason strin
 	})
 }
 
-func writeAnthropicStreamError(w http.ResponseWriter, streamErr error) error {
+func writeAnthropicStreamError(w http.ResponseWriter, vp *proxy.VertexProxy, streamErr error) error {
 	status := proxy.HTTPStatusForError(streamErr)
 	return writeAnthropicSSE(w, "error", map[string]interface{}{
 		"type": "error",
 		"error": map[string]interface{}{
 			"type":    anthropicErrorType(status, ""),
-			"message": publicServerErrorMessageFor(streamErr),
+			"message": publicUpstreamErrorMessage(vp, streamErr),
 		},
 	})
 }

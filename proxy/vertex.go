@@ -40,19 +40,54 @@ const (
 	skipThoughtSignatureValidator       = "skip_thought_signature_validator"
 )
 
+// ErrNoAssistantOutput reports a syntactically successful upstream response
+// that contains no text, thought text, image, or function call. Such responses
+// are safe to retry because nothing user-visible has been emitted yet.
+var ErrNoAssistantOutput = errors.New("upstream response contained no assistant output")
+
+// loggedUpstreamError marks a terminal upstream error whose full diagnostic
+// context has already been written by the retry layer. Protocol handlers still
+// receive and return the original error, but can avoid logging it a second time.
+type loggedUpstreamError struct {
+	cause error
+}
+
+func (e *loggedUpstreamError) Error() string { return e.cause.Error() }
+func (e *loggedUpstreamError) Unwrap() error { return e.cause }
+
+func markUpstreamErrorLogged(err error) error {
+	if err == nil || IsUpstreamErrorLogged(err) {
+		return err
+	}
+	return &loggedUpstreamError{cause: err}
+}
+
+// IsUpstreamErrorLogged reports whether the retry layer already emitted the
+// terminal diagnostic for err. It does not affect error matching or HTTP status
+// conversion because loggedUpstreamError unwraps to the original cause.
+func IsUpstreamErrorLogged(err error) bool {
+	var loggedErr *loggedUpstreamError
+	return errors.As(err, &loggedErr)
+}
+
 // VertexProxy 封装 Vertex AI 的调用逻辑
 type VertexProxy struct {
-	httpClient *client.HTTPClient
-	tokenCache *recaptcha.TokenCache
-	cfg        *config.Config
+	httpClient      *client.HTTPClient
+	tokenCache      *recaptcha.TokenCache
+	cfg             *config.Config
+	code3RequestLog *code3RequestLog
 }
 
 func NewVertexProxy(httpClient *client.HTTPClient, tokenCache *recaptcha.TokenCache, cfg *config.Config) *VertexProxy {
-	return &VertexProxy{
+	vp := &VertexProxy{
 		httpClient: httpClient,
 		tokenCache: tokenCache,
 		cfg:        cfg,
 	}
+	if cfg != nil && cfg.LogCode3RequestBodies {
+		vp.code3RequestLog = newCode3RequestLog(code3RequestLogPath(cfg.APIKeyFile))
+	}
+	return vp
 }
 
 func (vp *VertexProxy) selectedVertexBaseURL() string {
@@ -77,6 +112,12 @@ func buildVertexAPIURL(baseURL, apiKey string) string {
 
 // CallResult 封装调用结果
 type CallResult struct {
+	// Parts preserves the exact order and union type of every part emitted by
+	// the primary Vertex candidate. The legacy typed slices below remain as
+	// convenience indexes for protocol adapters that cannot express mixed
+	// content ordering.
+	Parts             []model.VertexPart
+	Role              string
 	TextParts         []model.TextPart
 	ImageParts        []model.InlineData
 	FunctionCalls     []model.FunctionCall
@@ -91,11 +132,68 @@ type CallResult struct {
 	ModelStatus       map[string]interface{}
 }
 
+func (r *CallResult) HasAssistantOutput() bool {
+	if r == nil {
+		return false
+	}
+	for _, part := range r.Parts {
+		if vertexPartHasOutput(part) {
+			return true
+		}
+	}
+	for _, part := range r.TextParts {
+		if part.Text != "" {
+			return true
+		}
+	}
+	for _, part := range r.ImageParts {
+		if part.Data != "" {
+			return true
+		}
+	}
+	if len(r.FunctionCalls) > 0 {
+		return true
+	}
+	for _, candidate := range r.Candidates {
+		for _, part := range candidate.Parts {
+			if vertexPartHasOutput(part) {
+				return true
+			}
+		}
+		for _, part := range candidate.TextParts {
+			if part.Text != "" {
+				return true
+			}
+		}
+		for _, part := range candidate.ImageParts {
+			if part.Data != "" {
+				return true
+			}
+		}
+		if len(candidate.FunctionCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func vertexPartHasOutput(part model.VertexPart) bool {
+	return part.Text != "" ||
+		(part.InlineData != nil && part.InlineData.Data != "") ||
+		len(part.FileData) > 0 ||
+		(part.FunctionCall != nil && part.FunctionCall.Name != "") ||
+		part.FunctionResponse != nil ||
+		len(part.ExecutableCode) > 0 ||
+		len(part.CodeExecutionResult) > 0
+}
+
 // CandidateResult retains candidate boundaries for native Gemini responses.
 // Top-level fields mirror the first candidate for single-candidate adapters;
 // native Gemini and non-streaming OpenAI responses consume Candidates directly.
 type CandidateResult struct {
 	Index              int
+	Role               string
+	Parts              []model.VertexPart
 	TextParts          []model.TextPart
 	ImageParts         []model.InlineData
 	FunctionCalls      []model.FunctionCall
@@ -113,26 +211,55 @@ func (r *CallResult) HasContent() bool {
 	if r == nil {
 		return false
 	}
-	return len(r.TextParts) > 0 || len(r.ImageParts) > 0 || len(r.FunctionCalls) > 0 || r.GroundingMetadata != nil
+	if len(r.Parts) > 0 || len(r.TextParts) > 0 || len(r.ImageParts) > 0 || len(r.FunctionCalls) > 0 || r.GroundingMetadata != nil {
+		return true
+	}
+	for _, candidate := range r.Candidates {
+		if len(candidate.Parts) > 0 || len(candidate.TextParts) > 0 || len(candidate.ImageParts) > 0 || len(candidate.FunctionCalls) > 0 || candidate.GroundingMetadata != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *CallResult) HasMetadata() bool {
 	if r == nil {
 		return false
 	}
-	return len(r.UsageMetadata) > 0 || r.ModelVersion != "" || r.ResponseID != "" || r.CreateTime != "" ||
-		len(r.PromptFeedback) > 0 || len(r.ModelStatus) > 0
+	if len(r.UsageMetadata) > 0 || r.ModelVersion != "" || r.ResponseID != "" || r.CreateTime != "" ||
+		len(r.PromptFeedback) > 0 || len(r.ModelStatus) > 0 {
+		return true
+	}
+	for _, candidate := range r.Candidates {
+		if candidate.FinishMessage != "" || len(candidate.SafetyRatings) > 0 ||
+			len(candidate.CitationMetadata) > 0 || len(candidate.URLContextMetadata) > 0 ||
+			len(candidate.LogprobsResult) > 0 || candidate.AvgLogprobs != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *CallResult) IsEmpty() bool {
 	if r == nil {
 		return true
 	}
-	return !r.HasContent() && !r.HasMetadata() && r.FinishReason == ""
+	return !r.HasContent() && !r.HasMetadata() && !r.HasFinishReason()
 }
 
-func (r *CallResult) IsFinishOnly() bool {
-	return r != nil && !r.HasContent() && !r.HasMetadata() && r.FinishReason != ""
+func (r *CallResult) HasFinishReason() bool {
+	if r == nil {
+		return false
+	}
+	if r.FinishReason != "" {
+		return true
+	}
+	for _, candidate := range r.Candidates {
+		if candidate.FinishReason != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildVertexBody 构建 Vertex AI GraphQL 请求体
@@ -148,8 +275,9 @@ func BuildVertexBody(
 }
 
 type VertexRequestOptions struct {
-	Tools      interface{}
-	ToolConfig interface{}
+	Tools               interface{}
+	ToolConfig          interface{}
+	AdditionalVariables map[string]interface{}
 }
 
 func BuildVertexBodyWithOptions(
@@ -183,15 +311,22 @@ func BuildVertexBodyWithOptions(
 
 	sanitizeThinkingConfig(modelName, genConfig)
 	model.SanitizeGenerationConfigResponseModalities(modelName, genConfig)
+	normalizeGenerationConfigSchemas(genConfig)
 
 	if len(genConfig) > 0 {
 		req.Variables["generationConfig"] = genConfig
 	}
 
-	// safetySettings
+	_, hasModelArmor := additionalVariable(options, "modelArmorConfig")
+	if hasModelArmor && safetySettings != nil {
+		return nil, errors.New("modelArmorConfig and safetySettings cannot be used together")
+	}
+
+	// safetySettings. Vertex does not allow default or explicit safety settings
+	// together with modelArmorConfig.
 	if safetySettings != nil {
 		req.Variables["safetySettings"] = safetySettings
-	} else {
+	} else if !hasModelArmor {
 		req.Variables["safetySettings"] = defaultSafetySettings()
 	}
 
@@ -208,9 +343,42 @@ func BuildVertexBodyWithOptions(
 		if options.ToolConfig != nil {
 			req.Variables["toolConfig"] = options.ToolConfig
 		}
+		for key, value := range options.AdditionalVariables {
+			switch key {
+			case "model", "contents", "generationConfig", "safetySettings", "systemInstruction", "tools", "toolConfig", "recaptchaToken", "region":
+				continue
+			default:
+				req.Variables[key] = value
+			}
+		}
 	}
 
 	return sonic.Marshal(req)
+}
+
+func additionalVariable(options *VertexRequestOptions, key string) (interface{}, bool) {
+	if options == nil || options.AdditionalVariables == nil {
+		return nil, false
+	}
+	value, ok := options.AdditionalVariables[key]
+	return value, ok && value != nil
+}
+
+func normalizeGenerationConfigSchemas(genConfig map[string]interface{}) {
+	if genConfig == nil {
+		return
+	}
+	if responseSchema, ok := genConfig["responseSchema"]; ok {
+		// responseSchema is Vertex's protobuf Schema input. Its type fields are
+		// enum values (OBJECT, STRING, ...), and protobuf map fields such as
+		// properties are represented as GraphQL key/value entry arrays.
+		genConfig["responseSchema"] = normalizeToolValue(responseSchema, true)
+	}
+	if responseJSONSchema, ok := genConfig["responseJsonSchema"]; ok {
+		// responseJsonSchema is actual JSON Schema and must keep lowercase type
+		// names and object-shaped properties.
+		genConfig["responseJsonSchema"] = schemanorm.Normalize(responseJSONSchema)
+	}
 }
 
 func sanitizeThinkingConfig(modelName string, genConfig map[string]interface{}) {
@@ -286,6 +454,7 @@ func normalizeContents(modelName string, contents []map[string]interface{}) ([]m
 		}
 		normalized = append(normalized, contentCopy)
 	}
+	normalized = reconcileFunctionCallHistory(modelName, normalized)
 	normalized = trimTrailingEmptyModelTurns(normalized)
 	if len(normalized) == 0 {
 		return nil, errors.New("contents must contain at least one non-empty turn")
@@ -298,6 +467,222 @@ func normalizeContents(modelName string, contents []map[string]interface{}) ([]m
 		}
 	}
 	return normalized, nil
+}
+
+type functionHistoryPart struct {
+	partIndex int
+	part      interface{}
+	id        string
+	name      string
+}
+
+// reconcileFunctionCallHistory repairs incomplete third-party tool history
+// before it reaches Vertex. Vertex requires every model function-call turn to
+// be followed by exactly the same number of function responses. Some clients
+// persist only the tool calls that completed, especially after parallel tool
+// execution is interrupted. Keeping the completed pairs and dropping orphaned
+// calls/responses is more faithful than inventing results for tools that never
+// ran.
+func reconcileFunctionCallHistory(modelName string, contents []map[string]interface{}) []map[string]interface{} {
+	for turn := 0; turn < len(contents); turn++ {
+		if normalizeRole(fmt.Sprintf("%v", contents[turn]["role"])) != "model" {
+			continue
+		}
+		modelParts, ok := toInterfaceSlice(contents[turn]["parts"])
+		if !ok {
+			continue
+		}
+		calls := collectFunctionHistoryParts(modelParts, "functionCall")
+		if len(calls) == 0 {
+			continue
+		}
+
+		var responseParts []interface{}
+		responseTurn := -1
+		if turn+1 < len(contents) && normalizeRole(fmt.Sprintf("%v", contents[turn+1]["role"])) == "user" {
+			if parts, partsOK := toInterfaceSlice(contents[turn+1]["parts"]); partsOK {
+				responseParts = parts
+				responseTurn = turn + 1
+			}
+		}
+		responses := collectFunctionHistoryParts(responseParts, "functionResponse")
+		if responseTurn < 0 || len(responses) == 0 {
+			// A standalone model function-call turn is also used by response and
+			// signature handling tests. Only reconcile once a client has actually
+			// supplied at least one function response for this call turn.
+			continue
+		}
+		pairs := matchFunctionHistoryParts(calls, responses)
+		if requiresFunctionCallID(modelName) {
+			ensureFunctionHistoryPairIDs(turn, pairs)
+		}
+		if functionHistoryPairsAlreadyAligned(calls, responses, pairs) {
+			continue
+		}
+
+		matchedCalls := make(map[int]bool, len(pairs))
+		matchedResponses := make([]interface{}, 0, len(pairs))
+		for _, pair := range pairs {
+			matchedCalls[pair.call.partIndex] = true
+			matchedResponses = append(matchedResponses, pair.response.part)
+		}
+
+		filteredModelParts := make([]interface{}, 0, len(modelParts))
+		for index, part := range modelParts {
+			if _, isCall := functionHistoryPartIdentity(part, "functionCall"); isCall && !matchedCalls[index] {
+				continue
+			}
+			filteredModelParts = append(filteredModelParts, part)
+		}
+		contents[turn]["parts"] = filteredModelParts
+
+		if responseTurn >= 0 {
+			filteredResponseParts := make([]interface{}, 0, len(responseParts)-len(responses)+len(matchedResponses))
+			for _, part := range responseParts {
+				if _, isResponse := functionHistoryPartIdentity(part, "functionResponse"); !isResponse {
+					filteredResponseParts = append(filteredResponseParts, part)
+				}
+			}
+			filteredResponseParts = append(filteredResponseParts, matchedResponses...)
+			contents[responseTurn]["parts"] = filteredResponseParts
+		}
+
+		log.Warn().
+			Str("model", modelName).
+			Int("turn", turn).
+			Int("function_calls", len(calls)).
+			Int("function_responses", len(responses)).
+			Int("matched_pairs", len(pairs)).
+			Msg("Repaired incomplete function call history before Vertex request")
+	}
+
+	filtered := make([]map[string]interface{}, 0, len(contents))
+	for _, content := range contents {
+		if contentTurnHasContent(content) {
+			filtered = append(filtered, content)
+		}
+	}
+	return filtered
+}
+
+type functionHistoryPair struct {
+	call     functionHistoryPart
+	response functionHistoryPart
+}
+
+func collectFunctionHistoryParts(parts []interface{}, field string) []functionHistoryPart {
+	result := make([]functionHistoryPart, 0)
+	for index, part := range parts {
+		identity, ok := functionHistoryPartIdentity(part, field)
+		if !ok {
+			continue
+		}
+		identity.partIndex = index
+		identity.part = part
+		result = append(result, identity)
+	}
+	return result
+}
+
+func functionHistoryPartIdentity(part interface{}, field string) (functionHistoryPart, bool) {
+	partMap, ok := part.(map[string]interface{})
+	if !ok {
+		return functionHistoryPart{}, false
+	}
+	value, ok := partMap[field].(map[string]interface{})
+	if !ok {
+		return functionHistoryPart{}, false
+	}
+	return functionHistoryPart{
+		id:   strings.TrimSpace(stringValue(value, "id")),
+		name: strings.TrimSpace(stringValue(value, "name")),
+	}, true
+}
+
+func matchFunctionHistoryParts(calls, responses []functionHistoryPart) []functionHistoryPair {
+	used := make([]bool, len(responses))
+	pairs := make([]functionHistoryPair, 0, min(len(calls), len(responses)))
+	for _, call := range calls {
+		matched := -1
+		if call.id != "" {
+			for index, response := range responses {
+				if !used[index] && response.id != "" && response.id == call.id {
+					matched = index
+					break
+				}
+			}
+		}
+		if matched < 0 && call.name != "" {
+			for index, response := range responses {
+				if !used[index] && response.name != "" && response.name == call.name {
+					matched = index
+					break
+				}
+			}
+		}
+		if matched < 0 && call.id == "" && call.name == "" {
+			for index := range responses {
+				if !used[index] && responses[index].id == "" && responses[index].name == "" {
+					matched = index
+					break
+				}
+			}
+		}
+		if matched < 0 {
+			continue
+		}
+		used[matched] = true
+		pairs = append(pairs, functionHistoryPair{call: call, response: responses[matched]})
+	}
+	return pairs
+}
+
+func functionHistoryPairsAlreadyAligned(calls, responses []functionHistoryPart, pairs []functionHistoryPair) bool {
+	if len(pairs) != len(calls) || len(pairs) != len(responses) {
+		return false
+	}
+	for index, pair := range pairs {
+		if pair.call.partIndex != calls[index].partIndex || pair.response.partIndex != responses[index].partIndex {
+			return false
+		}
+	}
+	return true
+}
+
+// Gemini 3.6 requires every function response to reference the corresponding
+// function call ID. Some third-party clients omit both IDs and rely only on the
+// function name. Preserve an existing ID when possible; otherwise synthesize a
+// stable request-local ID for the already matched call/response pair.
+func ensureFunctionHistoryPairIDs(turn int, pairs []functionHistoryPair) {
+	for _, pair := range pairs {
+		callID := strings.TrimSpace(pair.call.id)
+		responseID := strings.TrimSpace(pair.response.id)
+
+		id := callID
+		if id == "" {
+			id = responseID
+		}
+		if id == "" {
+			id = fmt.Sprintf("call_vertex2api_%d_%d", turn, pair.call.partIndex)
+		}
+
+		setFunctionHistoryPartID(pair.call.part, "functionCall", id)
+		setFunctionHistoryPartID(pair.response.part, "functionResponse", id)
+	}
+}
+
+func setFunctionHistoryPartID(part interface{}, field, id string) {
+	partMap, ok := part.(map[string]interface{})
+	if !ok {
+		return
+	}
+	value, ok := partMap[field].(map[string]interface{})
+	if !ok {
+		return
+	}
+	valueCopy := copyMap(value)
+	valueCopy["id"] = id
+	partMap[field] = valueCopy
 }
 
 func normalizeRole(role string) string {
@@ -360,6 +745,11 @@ func requiresTrailingUserTurn(modelName string) bool {
 	return strings.HasPrefix(modelName, "gemini-3.6")
 }
 
+func requiresFunctionCallID(modelName string) bool {
+	modelName = strings.ToLower(strings.TrimSpace(modelName))
+	return strings.HasPrefix(modelName, "gemini-3.6")
+}
+
 // dropTrailingModelPrefill adapts Gemini 3.6's generateContent contract,
 // which disallows prefilled model turns. Other models are unchanged.
 func dropTrailingModelPrefill(modelName string, contents []map[string]interface{}) []map[string]interface{} {
@@ -414,6 +804,18 @@ func normalizePart(part map[string]interface{}) (map[string]interface{}, error) 
 	}
 
 	inlineValue, hasInline := partCopy["inlineData"]
+	if !hasInline {
+		// Some Gemini SDKs serialize their typed request models with Python-style
+		// snake_case field names. GraphQL silently ignores inline_data because the
+		// Vertex protobuf field is inlineData, leaving an empty Part.data oneof and
+		// producing Code 3 upstream. Accept the SDK spelling at the compatibility
+		// boundary, but always emit the canonical Vertex JSON field.
+		inlineValue, hasInline = partCopy["inline_data"]
+		if hasInline {
+			partCopy["inlineData"] = inlineValue
+		}
+	}
+	delete(partCopy, "inline_data")
 	if !hasInline {
 		return partCopy, nil
 	}
@@ -582,7 +984,7 @@ func normalizeFunctionDeclarations(value interface{}) interface{} {
 
 func isToolTypeField(key string) bool {
 	switch key {
-	case "functionDeclarations", "retrieval", "googleSearchRetrieval", "googleSearch", "enterpriseWebSearch", "codeExecution", "urlContext":
+	case "functionDeclarations", "retrieval", "googleSearchRetrieval", "googleSearch", "googleMaps", "enterpriseWebSearch", "parallelAiSearch", "codeExecution", "urlContext", "computerUse":
 		return true
 	default:
 		return false
@@ -843,6 +1245,9 @@ func isSchemaField(key string) bool {
 
 func normalizeInlineData(inlineData map[string]interface{}) (map[string]interface{}, error) {
 	mimeType := stringValue(inlineData, "mimeType")
+	if mimeType == "" {
+		mimeType = stringValue(inlineData, "mime_type")
+	}
 	data := stringValue(inlineData, "data")
 	if data == "" {
 		return nil, fmt.Errorf("inlineData.data is required")
@@ -856,10 +1261,18 @@ func normalizeInlineData(inlineData map[string]interface{}) (map[string]interfac
 		normalizedMime = "image/png"
 	}
 
-	return map[string]interface{}{
+	normalized := map[string]interface{}{
 		"mimeType": normalizedMime,
 		"data":     normalizedData,
-	}, nil
+	}
+	displayName := stringValue(inlineData, "displayName")
+	if displayName == "" {
+		displayName = stringValue(inlineData, "display_name")
+	}
+	if displayName != "" {
+		normalized["displayName"] = displayName
+	}
+	return normalized, nil
 }
 
 func normalizeBytesData(mimeType, data string) (string, string, error) {
@@ -1063,6 +1476,9 @@ func classifyRecaptchaRetryError(err error) recaptchaRetryReason {
 }
 
 func isRetryableVertexError(status int, err error) bool {
+	if errors.Is(err, ErrNoAssistantOutput) {
+		return true
+	}
 	if status == 8 {
 		return true
 	}
@@ -1104,6 +1520,9 @@ func (e *upstreamHTTPError) Error() string {
 // status codes to their public HTTP equivalents. Protocol adapters use this
 // only before streaming response headers have been committed.
 func HTTPStatusForError(err error) int {
+	if errors.Is(err, ErrNoAssistantOutput) {
+		return http.StatusBadGateway
+	}
 	var httpErr *upstreamHTTPError
 	if errors.As(err, &httpErr) && httpErr.Status >= 400 && httpErr.Status <= 599 {
 		return httpErr.Status
@@ -1134,7 +1553,14 @@ func HTTPStatusForError(err error) int {
 // CallContext invokes Vertex AI with retries. The first "Failed to verify
 // action" response for a token is treated as a warm-up error.
 func (vp *VertexProxy) CallContext(ctx context.Context, bodyJSON []byte) (*CallResult, error) {
-	return vp.call(ctx, bodyJSON, nil)
+	return vp.call(ctx, bodyJSON, nil, false)
+}
+
+// CallRequireAssistantOutputContext is intended for protocols, such as the
+// OpenAI Responses API, where a successful terminal response without any
+// assistant output would otherwise look like a silently completed turn.
+func (vp *VertexProxy) CallRequireAssistantOutputContext(ctx context.Context, bodyJSON []byte) (*CallResult, error) {
+	return vp.call(ctx, bodyJSON, nil, true)
 }
 
 func (vp *VertexProxy) maxRetry() int {
@@ -1159,14 +1585,12 @@ func (vp *VertexProxy) retryDelay() time.Duration {
 }
 
 func (vp *VertexProxy) upstreamLogError(err error) string {
-	redact := vp != nil && vp.cfg != nil && vp.cfg.RedactUpstreamLogs
-	return config.UpstreamLogError(err, redact, 120)
+	return config.UpstreamLogError(err, false, 120)
 }
 
-// withUpstreamError keeps the structured error field while applying the same
-// redaction policy used by the existing upstream log messages. Passing a
-// sanitized error to zerolog avoids leaking the raw upstream response when
-// REDACT_UPSTREAM_LOGS is enabled.
+// withUpstreamError keeps a structured, length-limited upstream error in the
+// server log. Downstream response redaction is applied by protocol handlers and
+// never changes diagnostic logging.
 func (vp *VertexProxy) withUpstreamError(event *zerolog.Event, err error) *zerolog.Event {
 	if err == nil {
 		return event
@@ -1174,10 +1598,15 @@ func (vp *VertexProxy) withUpstreamError(event *zerolog.Event, err error) *zerol
 	return event.Err(errors.New(vp.upstreamLogError(err)))
 }
 
-// UpstreamLogError applies the configured upstream error logging policy to
-// errors surfaced to protocol handlers.
+// UpstreamLogError formats an upstream error for server-side diagnostics.
 func (vp *VertexProxy) UpstreamLogError(err error) string {
 	return vp.upstreamLogError(err)
+}
+
+// RedactUpstreamResponses reports whether protocol handlers should replace
+// upstream error details before sending an error response to the caller.
+func (vp *VertexProxy) RedactUpstreamResponses() bool {
+	return vp != nil && vp.cfg != nil && vp.cfg.RedactUpstreamResponses
 }
 
 func extractModelName(bodyJSON []byte) string {
@@ -1192,7 +1621,7 @@ func extractModelName(bodyJSON []byte) string {
 	return modelName
 }
 
-func (vp *VertexProxy) call(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease) (*CallResult, error) {
+func (vp *VertexProxy) call(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease, requireAssistantOutput bool) (*CallResult, error) {
 	defer func() {
 		if tokenLease != nil {
 			tokenLease.Release()
@@ -1214,7 +1643,7 @@ func (vp *VertexProxy) call(ctx context.Context, bodyJSON []byte, tokenLease *re
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			result, status, err := vp.doCall(ctx, bodyJSON, tokenLease)
+			result, status, err := vp.doCall(ctx, bodyJSON, tokenLease, requireAssistantOutput)
 			if err == nil && result != nil {
 				return result, nil
 			}
@@ -1273,12 +1702,15 @@ func (vp *VertexProxy) call(ctx context.Context, bodyJSON []byte, tokenLease *re
 			if status == 3 {
 				retryLog = retryLog.Str("recaptcha_reason", string(recaptchaReason))
 			}
-			retryLog.Msg("Vertex API call failed, retrying on current token...")
+			retryLog.Msg(compatibilityLayerLogMessage(ctx, "call failed, retrying on current token..."))
 			if tokenRetry <= maxRetry {
 				if err := sleepContext(ctx, vp.retryDelay()); err != nil {
 					return nil, err
 				}
 				continue
+			}
+			if errors.Is(lastErr, ErrNoAssistantOutput) {
+				return nil, lastErr
 			}
 			break
 		}
@@ -1289,7 +1721,7 @@ func (vp *VertexProxy) call(ctx context.Context, bodyJSON []byte, tokenLease *re
 			bodyJSON, tokenLease, replaceErr = vp.replaceRecaptchaTokenForRetry(ctx, bodyJSON, tokenLease)
 			if replaceErr != nil {
 				log.Error().Str("err", vp.upstreamLogError(replaceErr)).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Failed to refresh recaptcha token")
-				return nil, replaceErr
+				return nil, markUpstreamErrorLogged(replaceErr)
 			}
 			log.Info().Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Refreshed recaptcha token, starting retries with new token")
 			if err := sleepContext(ctx, vp.retryDelay()); err != nil {
@@ -1298,12 +1730,11 @@ func (vp *VertexProxy) call(ctx context.Context, bodyJSON []byte, tokenLease *re
 			continue
 		}
 
-		vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Recaptcha token refresh limit reached, retries exhausted")
 		break
 	}
 
-	vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Vertex API call failed after retries")
-	return nil, lastErr
+	vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg(compatibilityLayerLogMessage(ctx, "call failed after retries"))
+	return nil, markUpstreamErrorLogged(lastErr)
 }
 
 func (vp *VertexProxy) BuildBodyWithTokenWithOptionsContext(
@@ -1342,19 +1773,43 @@ func (vp *VertexProxy) CallWithTokenWithOptionsContext(
 	if err != nil {
 		return nil, err
 	}
-	return vp.call(ctx, bodyJSON, tokenLease)
+	return vp.call(ctx, bodyJSON, tokenLease, false)
+}
+
+func (vp *VertexProxy) CallWithTokenWithOptionsRequireAssistantOutputContext(
+	ctx context.Context,
+	modelName string,
+	contents []map[string]interface{},
+	genConfig map[string]interface{},
+	safetySettings []map[string]string,
+	systemInstruction interface{},
+	options *VertexRequestOptions,
+) (*CallResult, error) {
+	bodyJSON, tokenLease, err := vp.BuildBodyWithTokenWithOptionsContext(ctx, modelName, contents, genConfig, safetySettings, systemInstruction, options)
+	if err != nil {
+		return nil, err
+	}
+	return vp.call(ctx, bodyJSON, tokenLease, true)
 }
 
 // StreamContext calls Vertex AI and emits each decoded upstream chunk immediately.
 func (vp *VertexProxy) StreamContext(ctx context.Context, bodyJSON []byte, onChunk func(*CallResult) error) error {
-	return vp.stream(ctx, bodyJSON, nil, onChunk)
+	return vp.stream(ctx, bodyJSON, nil, false, onChunk)
 }
 
 func (vp *VertexProxy) StreamWithTokenContext(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease, onChunk func(*CallResult) error) error {
-	return vp.stream(ctx, bodyJSON, tokenLease, onChunk)
+	return vp.stream(ctx, bodyJSON, tokenLease, false, onChunk)
 }
 
-func (vp *VertexProxy) stream(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease, onChunk func(*CallResult) error) error {
+func (vp *VertexProxy) StreamWithTokenRequireAssistantOutputContext(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease, onChunk func(*CallResult) error) error {
+	return vp.stream(ctx, bodyJSON, tokenLease, true, onChunk)
+}
+
+func (vp *VertexProxy) StreamRequireAssistantOutputContext(ctx context.Context, bodyJSON []byte, onChunk func(*CallResult) error) error {
+	return vp.stream(ctx, bodyJSON, nil, true, onChunk)
+}
+
+func (vp *VertexProxy) stream(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease, requireAssistantOutput bool, onChunk func(*CallResult) error) error {
 	defer func() {
 		if tokenLease != nil {
 			tokenLease.Release()
@@ -1377,10 +1832,38 @@ func (vp *VertexProxy) stream(ctx context.Context, bodyJSON []byte, tokenLease *
 				return err
 			}
 			emitted := false
+			hasAssistantOutput := false
+			pending := make([]*CallResult, 0, 2)
 			status, err := vp.doStream(ctx, bodyJSON, tokenLease, func(result *CallResult) error {
+				if result == nil {
+					return nil
+				}
+				if !requireAssistantOutput {
+					emitted = true
+					return onChunk(result)
+				}
+				if !hasAssistantOutput && !result.HasAssistantOutput() {
+					pendingResult := *result
+					pending = append(pending, &pendingResult)
+					return nil
+				}
+				if !hasAssistantOutput {
+					hasAssistantOutput = true
+					for _, pendingResult := range pending {
+						emitted = true
+						if err := onChunk(pendingResult); err != nil {
+							return err
+						}
+					}
+					pending = nil
+				}
 				emitted = true
 				return onChunk(result)
 			})
+			if requireAssistantOutput && err == nil && !hasAssistantOutput {
+				status = 999
+				err = ErrNoAssistantOutput
+			}
 			if err == nil {
 				return nil
 			}
@@ -1437,12 +1920,15 @@ func (vp *VertexProxy) stream(ctx context.Context, bodyJSON []byte, tokenLease *
 			if status == 3 {
 				retryLog = retryLog.Str("recaptcha_reason", string(recaptchaReason))
 			}
-			retryLog.Msg("Vertex API stream failed, retrying on current token...")
+			retryLog.Msg(compatibilityLayerLogMessage(ctx, "stream failed, retrying on current token..."))
 			if tokenRetry <= maxRetry {
 				if err := sleepContext(ctx, vp.retryDelay()); err != nil {
 					return err
 				}
 				continue
+			}
+			if errors.Is(lastErr, ErrNoAssistantOutput) {
+				return lastErr
 			}
 			break
 		}
@@ -1453,7 +1939,7 @@ func (vp *VertexProxy) stream(ctx context.Context, bodyJSON []byte, tokenLease *
 			bodyJSON, tokenLease, replaceErr = vp.replaceRecaptchaTokenForRetry(ctx, bodyJSON, tokenLease)
 			if replaceErr != nil {
 				log.Error().Str("err", vp.upstreamLogError(replaceErr)).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Failed to refresh recaptcha token")
-				return replaceErr
+				return markUpstreamErrorLogged(replaceErr)
 			}
 			log.Info().Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Refreshed recaptcha token, starting stream retries with new token")
 			if err := sleepContext(ctx, vp.retryDelay()); err != nil {
@@ -1462,15 +1948,14 @@ func (vp *VertexProxy) stream(ctx context.Context, bodyJSON []byte, tokenLease *
 			continue
 		}
 
-		vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Recaptcha token refresh limit reached, stream retries exhausted")
 		break
 	}
 
-	vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg("Vertex API stream failed after retries")
-	return lastErr
+	vp.withUpstreamError(log.Error(), lastErr).Str("model", modelName).Int("refresh", refreshCount).Int("max_refresh", maxRefresh).Msg(compatibilityLayerLogMessage(ctx, "stream failed after retries"))
+	return markUpstreamErrorLogged(lastErr)
 }
 
-func (vp *VertexProxy) doCall(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease) (*CallResult, int, error) {
+func (vp *VertexProxy) doCall(ctx context.Context, bodyJSON []byte, tokenLease *recaptcha.TokenLease, requireAssistantOutput bool) (*CallResult, int, error) {
 	result := &CallResult{}
 	status, err := vp.doStream(ctx, bodyJSON, tokenLease, func(chunk *CallResult) error {
 		mergeCallResult(result, chunk)
@@ -1481,11 +1966,13 @@ func (vp *VertexProxy) doCall(ctx context.Context, bodyJSON []byte, tokenLease *
 	}
 
 	result.TextParts = coalesceTextParts(result.TextParts)
+	result.Parts = coalesceVertexParts(result.Parts)
 	for i := range result.Candidates {
 		result.Candidates[i].TextParts = coalesceTextParts(result.Candidates[i].TextParts)
+		result.Candidates[i].Parts = coalesceVertexParts(result.Candidates[i].Parts)
 	}
-	if result.IsEmpty() {
-		return nil, 999, fmt.Errorf("response contains no data")
+	if requireAssistantOutput && !result.HasAssistantOutput() {
+		return nil, 999, ErrNoAssistantOutput
 	}
 
 	return result, 0, nil
@@ -1543,6 +2030,9 @@ func (vp *VertexProxy) doStream(ctx context.Context, bodyJSON []byte, tokenLease
 	}
 
 	status, streamErr := streamVertexResponse(resp.Body, onChunk)
+	if status == 3 && streamErr != nil {
+		vp.captureCode3Request(streamErr, bodyJSON)
+	}
 	if streamErr == nil {
 		stats.RecordSuccess(vertexBase)
 		stats.RecordSuccess(recaptchaBase)
@@ -1581,8 +2071,10 @@ func aggregateVertexResponse(r io.Reader) (*CallResult, int, error) {
 		return nil, status, err
 	}
 	result.TextParts = coalesceTextParts(result.TextParts)
+	result.Parts = coalesceVertexParts(result.Parts)
 	for i := range result.Candidates {
 		result.Candidates[i].TextParts = coalesceTextParts(result.Candidates[i].TextParts)
+		result.Candidates[i].Parts = coalesceVertexParts(result.Candidates[i].Parts)
 	}
 	return result, 0, nil
 }
@@ -1591,11 +2083,15 @@ func mergeCallResult(dst, src *CallResult) {
 	if dst == nil || src == nil {
 		return
 	}
+	dst.Parts = append(dst.Parts, src.Parts...)
 	dst.TextParts = append(dst.TextParts, src.TextParts...)
 	dst.ImageParts = append(dst.ImageParts, src.ImageParts...)
 	dst.FunctionCalls = append(dst.FunctionCalls, src.FunctionCalls...)
 	if src.FinishReason != "" {
 		dst.FinishReason = src.FinishReason
+	}
+	if src.Role != "" {
+		dst.Role = src.Role
 	}
 	if src.GroundingMetadata != nil {
 		dst.GroundingMetadata = src.GroundingMetadata
@@ -1629,6 +2125,10 @@ func mergeCandidateResult(result *CallResult, incoming CandidateResult) {
 		if candidate.Index != incoming.Index {
 			continue
 		}
+		if incoming.Role != "" {
+			candidate.Role = incoming.Role
+		}
+		candidate.Parts = append(candidate.Parts, incoming.Parts...)
 		candidate.TextParts = append(candidate.TextParts, incoming.TextParts...)
 		candidate.ImageParts = append(candidate.ImageParts, incoming.ImageParts...)
 		candidate.FunctionCalls = append(candidate.FunctionCalls, incoming.FunctionCalls...)
@@ -1677,6 +2177,28 @@ func coalesceTextParts(parts []model.TextPart) []model.TextPart {
 			merged[lastIndex].ThoughtSignature == "" &&
 			merged[lastIndex].Thought == part.Thought {
 			merged[lastIndex].Text += part.Text
+			continue
+		}
+		merged = append(merged, part)
+	}
+	return merged
+}
+
+func coalesceVertexParts(parts []model.VertexPart) []model.VertexPart {
+	if len(parts) <= 1 {
+		return parts
+	}
+	merged := make([]model.VertexPart, 0, len(parts))
+	for _, part := range parts {
+		if !vertexPartHasOutput(part) && part.ThoughtSignature == "" && len(part.VideoMetadata) == 0 {
+			continue
+		}
+		last := len(merged) - 1
+		if last >= 0 && part.Text != "" && merged[last].Text != "" &&
+			part.Thought == merged[last].Thought && part.ThoughtSignature == "" && merged[last].ThoughtSignature == "" &&
+			part.InlineData == nil && part.FunctionCall == nil && part.FunctionResponse == nil &&
+			len(part.FileData) == 0 && len(part.ExecutableCode) == 0 && len(part.CodeExecutionResult) == 0 {
+			merged[last].Text += part.Text
 			continue
 		}
 		merged = append(merged, part)
@@ -1782,7 +2304,9 @@ func collectVertexData(result *CallResult, data *model.VertexData) {
 			AvgLogprobs:        candidate.AvgLogprobs,
 		}
 		if candidate.Content != nil {
+			candidateResult.Role = candidate.Content.Role
 			for _, part := range candidate.Content.Parts {
+				candidateResult.Parts = append(candidateResult.Parts, part)
 				hasFunctionCall := part.FunctionCall != nil && part.FunctionCall.Name != ""
 				hasInlineData := part.InlineData != nil && part.InlineData.Data != ""
 				if part.Text != "" || (part.ThoughtSignature != "" && !hasFunctionCall && !hasInlineData) {
@@ -1813,6 +2337,10 @@ func collectVertexData(result *CallResult, data *model.VertexData) {
 		return
 	}
 	result.TextParts = append(result.TextParts, primary.TextParts...)
+	result.Parts = append(result.Parts, primary.Parts...)
+	if primary.Role != "" {
+		result.Role = primary.Role
+	}
 	result.ImageParts = append(result.ImageParts, primary.ImageParts...)
 	result.FunctionCalls = append(result.FunctionCalls, primary.FunctionCalls...)
 	if primary.FinishReason != "" {
@@ -1866,15 +2394,40 @@ func (e *vertexStreamEmitter) emit(result *CallResult) error {
 	if result == nil || result.IsEmpty() {
 		return nil
 	}
-	if result.IsFinishOnly() {
-		pending := *result
-		e.pendingFinish = &pending
+	if finish := detachFinishReasons(result); finish != nil {
+		if e.pendingFinish == nil {
+			e.pendingFinish = &CallResult{}
+		}
+		mergeCallResult(e.pendingFinish, finish)
+	}
+	if result.IsEmpty() {
 		return nil
 	}
-	if result.FinishReason != "" {
-		e.pendingFinish = nil
-	}
 	return e.onChunk(result)
+}
+
+// detachFinishReasons keeps finishReason as completion metadata without using
+// it as a stream terminator. Vertex can emit STOP before later content chunks;
+// the actual stream boundary is EOF (or an explicit GraphQL error).
+func detachFinishReasons(result *CallResult) *CallResult {
+	if result == nil || !result.HasFinishReason() {
+		return nil
+	}
+
+	finish := &CallResult{FinishReason: result.FinishReason}
+	result.FinishReason = ""
+	for i := range result.Candidates {
+		candidate := &result.Candidates[i]
+		if candidate.FinishReason == "" {
+			continue
+		}
+		finish.Candidates = append(finish.Candidates, CandidateResult{
+			Index:        candidate.Index,
+			FinishReason: candidate.FinishReason,
+		})
+		candidate.FinishReason = ""
+	}
+	return finish
 }
 
 func (e *vertexStreamEmitter) flush() error {

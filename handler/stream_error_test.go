@@ -8,9 +8,78 @@ import (
 	"strings"
 	"testing"
 
+	"vertex2api/config"
 	"vertex2api/model"
 	"vertex2api/proxy"
 )
+
+func TestUpstreamResponseRedactionDoesNotExposeDetail(t *testing.T) {
+	vp := proxy.NewVertexProxy(nil, nil, &config.Config{RedactUpstreamResponses: true})
+	err := errors.New("sensitive upstream response body")
+	if got := publicUpstreamErrorMessage(vp, err); got != publicServerErrorMessage {
+		t.Fatalf("public message = %q, want %q", got, publicServerErrorMessage)
+	}
+	if got := vp.UpstreamLogError(err); got != "sensitive upstream response body" {
+		t.Fatalf("server log message = %q, want original detail", got)
+	}
+}
+
+func TestUpstreamResponseRedactionCoversAllStreamingProtocols(t *testing.T) {
+	const secret = "sensitive upstream response body"
+	vp := proxy.NewVertexProxy(nil, nil, &config.Config{RedactUpstreamResponses: true})
+	stream := func(context.Context, func(*proxy.CallResult) error) error {
+		return errors.New(secret)
+	}
+
+	tests := []struct {
+		name string
+		run  func(*httptest.ResponseRecorder)
+	}{
+		{
+			name: "openai_chat",
+			run: func(rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				streamResponseForRequestWithProxy(rec, req, model.ChatCompletionRequest{Model: "gemini-test", Stream: true}, vp, stream)
+			},
+		},
+		{
+			name: "gemini",
+			run: func(rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-test:streamGenerateContent", nil)
+				streamGeminiResponseWithProxy(rec, req, "gemini-test", vp, stream)
+			},
+		},
+		{
+			name: "anthropic",
+			run: func(rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+				streamAnthropicResponseWithProxy(rec, req, model.AnthropicMessageRequest{Model: "gemini-test", Stream: true}, vp, stream)
+			},
+		},
+		{
+			name: "openai_responses",
+			run: func(rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				api := &ResponsesAPI{vp: vp}
+				api.streamResponse(rec, req, model.ResponseRequest{Model: "gemini-test", Stream: true}, model.ChatCompletionRequest{Model: "gemini-test", Stream: true}, nil, nil, stream)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			test.run(rec)
+			body := rec.Body.String()
+			if strings.Contains(body, secret) {
+				t.Fatalf("response leaked upstream detail: %s", body)
+			}
+			if !strings.Contains(body, publicServerErrorMessage) {
+				t.Fatalf("response does not contain generic error: %s", body)
+			}
+		})
+	}
+}
 
 func TestOpenAIStreamFirstErrorUsesHTTPJSON(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
