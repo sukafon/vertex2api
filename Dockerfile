@@ -8,7 +8,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-ARG VERSION=1.0.5
+ARG VERSION=1.0.6
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 ARG GOAMD64=v3
