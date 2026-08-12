@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -803,6 +805,28 @@ func normalizePart(part map[string]interface{}) (map[string]interface{}, error) 
 		return nil, err
 	}
 
+	fileValue, hasFile := partCopy["fileData"]
+	if !hasFile {
+		// Accept the snake_case spelling emitted by some typed Gemini SDKs, but
+		// always send Vertex's canonical GraphQL field name upstream.
+		fileValue, hasFile = partCopy["file_data"]
+		if hasFile {
+			partCopy["fileData"] = fileValue
+		}
+	}
+	delete(partCopy, "file_data")
+	if hasFile {
+		fileData, ok := fileValue.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("fileData must be an object")
+		}
+		normalizedFile, err := normalizeFileData(fileData)
+		if err != nil {
+			return nil, err
+		}
+		partCopy["fileData"] = normalizedFile
+	}
+
 	inlineValue, hasInline := partCopy["inlineData"]
 	if !hasInline {
 		// Some Gemini SDKs serialize their typed request models with Python-style
@@ -831,6 +855,48 @@ func normalizePart(part map[string]interface{}) (map[string]interface{}, error) 
 	}
 	partCopy["inlineData"] = normalizedInline
 	return partCopy, nil
+}
+
+func normalizeFileData(fileData map[string]interface{}) (map[string]interface{}, error) {
+	fileURI := strings.TrimSpace(stringValue(fileData, "fileUri"))
+	if fileURI == "" {
+		fileURI = strings.TrimSpace(stringValue(fileData, "file_uri"))
+	}
+	if fileURI == "" {
+		return nil, fmt.Errorf("fileData.fileUri is required")
+	}
+
+	mimeType := strings.TrimSpace(stringValue(fileData, "mimeType"))
+	if mimeType == "" {
+		mimeType = strings.TrimSpace(stringValue(fileData, "mime_type"))
+	}
+	if mimeType == "" {
+		mimeType = inferMIMETypeFromURI(fileURI)
+	}
+	if mimeType == "" {
+		return nil, fmt.Errorf("fileData.mimeType is required and could not be inferred from fileUri %q", fileURI)
+	}
+
+	return map[string]interface{}{
+		"fileUri":  fileURI,
+		"mimeType": mimeType,
+	}, nil
+}
+
+func inferMIMETypeFromURI(fileURI string) string {
+	uriPath := fileURI
+	if parsed, err := url.Parse(fileURI); err == nil && parsed.Path != "" {
+		uriPath = parsed.Path
+	}
+	extension := strings.ToLower(path.Ext(uriPath))
+	if extension == "" {
+		return ""
+	}
+	mimeType := mime.TypeByExtension(extension)
+	if separator := strings.IndexByte(mimeType, ';'); separator >= 0 {
+		mimeType = mimeType[:separator]
+	}
+	return strings.TrimSpace(mimeType)
 }
 
 func normalizeThoughtSignature(part map[string]interface{}) error {

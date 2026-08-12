@@ -1754,6 +1754,70 @@ func TestBuildVertexBodyNormalizesSnakeCaseInlineData(t *testing.T) {
 	}
 }
 
+func TestBuildVertexBodyNormalizesFileDataAndInfersMimeType(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{
+					"text": "production Code 3 reproduction",
+				},
+				{
+					"file_data": map[string]interface{}{
+						"file_uri": "/image/%E6%9C%8B%E5%8F%8B%E5%9C%88%E9%BB%98%E8%AE%A4%E8%83%8C%E6%99%AF%E5%9B%BE.png?version=1",
+					},
+				},
+			},
+		},
+	}
+
+	body, err := BuildVertexBody("gemini-3.5-flash", contents, nil, nil, nil, "token")
+	if err != nil {
+		t.Fatalf("BuildVertexBody returned error: %v", err)
+	}
+
+	part := secondPartFromBody(t, body)
+	if _, exists := part["file_data"]; exists {
+		t.Fatalf("snake_case file_data leaked into Vertex body: %v", part)
+	}
+	fileData, ok := part["fileData"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("fileData = %#v, want object", part["fileData"])
+	}
+	if got := fileData["fileUri"]; got != "/image/%E6%9C%8B%E5%8F%8B%E5%9C%88%E9%BB%98%E8%AE%A4%E8%83%8C%E6%99%AF%E5%9B%BE.png?version=1" {
+		t.Fatalf("fileUri = %v", got)
+	}
+	if got := fileData["mimeType"]; got != "image/png" {
+		t.Fatalf("mimeType = %v, want image/png", got)
+	}
+	if _, exists := fileData["file_uri"]; exists {
+		t.Fatalf("snake_case file_uri leaked into Vertex body: %v", fileData)
+	}
+}
+
+func TestBuildVertexBodyRejectsFileDataWithoutMimeTypeOrKnownExtension(t *testing.T) {
+	contents := []map[string]interface{}{
+		{
+			"role": "user",
+			"parts": []map[string]interface{}{
+				{
+					"fileData": map[string]interface{}{
+						"fileUri": "/image/opaque-resource",
+					},
+				},
+			},
+		},
+	}
+
+	_, err := BuildVertexBody("gemini-3.5-flash", contents, nil, nil, nil, "token")
+	if err == nil {
+		t.Fatal("BuildVertexBody returned nil error")
+	}
+	if !strings.Contains(err.Error(), "fileData.mimeType is required") {
+		t.Fatalf("error = %v, want fileData.mimeType message", err)
+	}
+}
+
 func TestBuildVertexBodyRejectsRemoteImageURLAsInlineData(t *testing.T) {
 	contents := []map[string]interface{}{
 		{
