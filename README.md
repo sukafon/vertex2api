@@ -123,6 +123,7 @@ curl http://127.0.0.1:8080/v1/messages \
 | `TZ` | `Asia/Shanghai` | 日志和自动拉取任务使用的时区；可填写其他 IANA 时区 |
 | `ALLOW_UNAUTHENTICATED` | `false` | 显式允许无鉴权运行，仅建议本地开发使用 |
 | `ALLOW_CUSTOM_MODEL_NAMES` | `false` | 是否允许调用不在当前模型目录中的模型名称；开启后仍拒绝路径分隔符和 `..` 序列 |
+| `REJECT_CHAT_LIVENESS_PROBES` | `false` | 是否拒绝仅包含单条 `"hi"` 用户消息的 OpenAI Chat 请求；开启后应使用 `GET /health` 验活 |
 | `STATS_KEY` | 无 | `/v1/stats` 独立密钥；留空时该接口不可用 |
 | `HOST` | `0.0.0.0` | 服务监听地址，例如 `0.0.0.0` 或 `127.0.0.1` |
 | `PORT` | `8080` | 监听端口 |

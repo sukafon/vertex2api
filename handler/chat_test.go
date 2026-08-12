@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -12,6 +13,66 @@ import (
 
 	"github.com/bytedance/sonic"
 )
+
+func TestChatCompletionsRejectsWastefulLivenessProbeBeforeUpstreamCall(t *testing.T) {
+	handler := ChatCompletions(nil, true, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"gemini-3-flash-preview",
+		"messages":[{"role":"user","content":"hi"}],
+		"stream":false
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"invalid_request_error"`) ||
+		!strings.Contains(rec.Body.String(), `"code":"health_check_not_supported"`) ||
+		!strings.Contains(rec.Body.String(), "GET /health") {
+		t.Fatalf("unexpected liveness-probe error: %s", rec.Body.String())
+	}
+}
+
+func TestChatCompletionsAllowsLivenessProbeByDefault(t *testing.T) {
+	handler := ChatCompletions(nil, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if strings.Contains(rec.Body.String(), `"code":"health_check_not_supported"`) {
+		t.Fatalf("default-off liveness probe rejection was active: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "model is required") {
+		t.Fatalf("request did not continue through normal validation: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWastefulLivenessProbeDetectionAvoidsRealRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		req  model.ChatCompletionRequest
+	}{
+		{name: "normal prompt", req: model.ChatCompletionRequest{Messages: []model.ChatMessage{{Role: "user", Content: "hi there"}}}},
+		{name: "conversation history", req: model.ChatCompletionRequest{Messages: []model.ChatMessage{{Role: "assistant", Content: "hello"}, {Role: "user", Content: "hi"}}}},
+		{name: "tool request", req: model.ChatCompletionRequest{Messages: []model.ChatMessage{{Role: "user", Content: "hi"}}, Tools: []map[string]interface{}{{"type": "function"}}}},
+		{name: "structured content", req: model.ChatCompletionRequest{Messages: []model.ChatMessage{{Role: "user", Content: []interface{}{map[string]interface{}{"type": "text", "text": "hi"}}}}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if isWastefulLivenessProbe(tt.req) {
+				t.Fatal("real request was classified as a liveness probe")
+			}
+		})
+	}
+}
 
 func TestBuildResponseContentSeparatesReasoning(t *testing.T) {
 	content, reasoning := buildResponseContent(&proxy.CallResult{

@@ -62,6 +62,7 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamResponseRedaction(t *testing.T) {
 	t.Setenv("RANDOM_FINGERPRINT", "")
 	t.Setenv("TLS_CLIENT_PROFILE", "")
 	t.Setenv("ALLOW_CUSTOM_MODEL_NAMES", "")
+	t.Setenv("REJECT_CHAT_LIVENESS_PROBES", "")
 	cfg := Load()
 
 	if !cfg.AutoFetchModels {
@@ -81,6 +82,9 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamResponseRedaction(t *testing.T) {
 	}
 	if cfg.AllowCustomModelNames {
 		t.Fatal("ALLOW_CUSTOM_MODEL_NAMES default = true, want false")
+	}
+	if cfg.RejectChatLivenessProbe {
+		t.Fatal("REJECT_CHAT_LIVENESS_PROBES default = true, want false")
 	}
 }
 
@@ -102,6 +106,13 @@ func TestLoadCanEnableRandomFingerprint(t *testing.T) {
 	t.Setenv("RANDOM_FINGERPRINT", "true")
 	if cfg := Load(); !cfg.RandomFingerprint {
 		t.Fatal("RANDOM_FINGERPRINT = false, want true")
+	}
+}
+
+func TestLoadCanEnableChatLivenessProbeRejection(t *testing.T) {
+	t.Setenv("REJECT_CHAT_LIVENESS_PROBES", "true")
+	if cfg := Load(); !cfg.RejectChatLivenessProbe {
+		t.Fatal("REJECT_CHAT_LIVENESS_PROBES = false, want true")
 	}
 }
 

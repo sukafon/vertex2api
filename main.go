@@ -62,6 +62,7 @@ func run() error {
 		Int("write_timeout_seconds", cfg.WriteTimeoutSeconds).
 		Bool("auto_fetch_models", cfg.AutoFetchModels).
 		Bool("allow_custom_model_names", cfg.AllowCustomModelNames).
+		Bool("reject_chat_liveness_probes", cfg.RejectChatLivenessProbe).
 		Bool("redact_upstream_responses", cfg.RedactUpstreamResponses).
 		Msg("Configuration loaded")
 
@@ -117,7 +118,7 @@ func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Han
 	responsesAPI := handler.NewResponsesAPI(vertexProxy, cfg.AllowCustomModelNames, strings.Join(cfg.APIKeys, "\x00"))
 	mux.Handle("POST /v1/messages", handler.AnthropicMessages(vertexProxy, cfg.AllowCustomModelNames))
 	mux.Handle("POST /v1/messages/count_tokens", handler.AnthropicCountTokens(cfg.AllowCustomModelNames))
-	mux.Handle("POST /v1/chat/completions", handler.ChatCompletions(vertexProxy, cfg.AllowCustomModelNames))
+	mux.Handle("POST /v1/chat/completions", handler.ChatCompletions(vertexProxy, cfg.AllowCustomModelNames, cfg.RejectChatLivenessProbe))
 	mux.Handle("POST /v1/responses", responsesAPI.Responses())
 	mux.Handle("POST /v1/responses/compact", responsesAPI.Compact())
 	mux.Handle("POST /v1/images/generations", handler.ImageGenerations(vertexProxy, cfg.AllowCustomModelNames))

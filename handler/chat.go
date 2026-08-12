@@ -19,12 +19,22 @@ import (
 )
 
 // ChatCompletions 处理 POST /v1/chat/completions
-func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
+func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool, rejectLivenessProbes ...bool) http.Handler {
+	rejectLivenessProbe := len(rejectLivenessProbes) > 0 && rejectLivenessProbes[0]
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerOpenAIChatCompletions))
 		var req model.ChatCompletionRequest
 		_, ok := readJSONRequest(w, r, &req)
 		if !ok {
+			return
+		}
+
+		if rejectLivenessProbe && isWastefulLivenessProbe(req) {
+			WriteJSON(w, http.StatusBadRequest, model.ErrorResponse{Error: &model.APIError{
+				Message: `请勿使用模型推理请求进行验活。请改用 GET /health；发送 "hi" 等测试提示词会占用模型并发容量，挤占正常用户请求并浪费服务器资源。`,
+				Type:    "invalid_request_error",
+				Code:    "health_check_not_supported",
+			}})
 			return
 		}
 
@@ -117,6 +127,22 @@ func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Han
 
 		sendChatResponse(w, req, req.Model, result)
 	})
+}
+
+func isWastefulLivenessProbe(req model.ChatCompletionRequest) bool {
+	if len(req.Messages) != 1 || len(req.Tools) != 0 || req.ToolChoice != nil {
+		return false
+	}
+
+	message := req.Messages[0]
+	if !strings.EqualFold(strings.TrimSpace(message.Role), "user") ||
+		message.Name != "" || message.ToolCallID != "" || len(message.ToolCalls) != 0 ||
+		strings.TrimSpace(message.ReasoningContent) != "" {
+		return false
+	}
+
+	content, ok := message.Content.(string)
+	return ok && strings.EqualFold(strings.TrimSpace(content), "hi")
 }
 
 func validateOpenAIRequest(req model.ChatCompletionRequest) string {
