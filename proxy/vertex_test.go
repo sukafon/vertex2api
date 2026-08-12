@@ -15,6 +15,7 @@ import (
 
 	"vertex2api/client"
 	"vertex2api/config"
+	"vertex2api/model"
 	"vertex2api/recaptcha"
 
 	"github.com/bytedance/sonic"
@@ -244,10 +245,10 @@ func TestParseVertexResponsePreservesOrderedPartUnion(t *testing.T) {
 		`{"text":"thinking","thought":true,"thoughtSignature":"c2ln"},` +
 		`{"executableCode":{"language":"PYTHON","code":"print(1)"}},` +
 		`{"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"1"}},` +
-		`{"inlineData":{"mimeType":"image/png","data":"aW1n"},"thoughtSignature":"aW1nc2ln"},` +
+		`{"inlineData":{"mimeType":"image/png","data":"aW1n"},"videoMetadata":{"fps":2},"mediaResolution":{"level":"MEDIA_RESOLUTION_HIGH"},"thoughtSignature":"aW1nc2ln"},` +
 		`{"fileData":{"mimeType":"application/pdf","fileUri":"gs://bucket/a.pdf"}},` +
-		`{"functionCall":{"id":"call-1","name":"lookup","args":{"q":"x"}},"thoughtSignature":"Y2FsbHNpZw=="},` +
-		`{"functionResponse":{"id":"call-1","name":"lookup","response":{"ok":true}}}` +
+		`{"functionCall":{"id":"call-1","name":"","partialArgs":[{"jsonPath":"$.q","stringValue":"x","willContinue":true}],"willContinue":true},"thoughtSignature":"Y2FsbHNpZw=="},` +
+		`{"functionResponse":{"id":"call-1","name":"lookup","response":{"ok":true},"parts":[{"inlineData":{"mimeType":"image/png","data":"cmVzdWx0"}}]}}` +
 		`]}}]}}]}]`)
 	result, status, err := parseVertexResponse(body)
 	if err != nil || status != 0 {
@@ -261,6 +262,87 @@ func TestParseVertexResponsePreservesOrderedPartUnion(t *testing.T) {
 	}
 	if result.Parts[6].FunctionResponse.ID != "call-1" {
 		t.Fatalf("function response id = %q", result.Parts[6].FunctionResponse.ID)
+	}
+	if result.Parts[3].MediaResolution["level"] != "MEDIA_RESOLUTION_HIGH" || result.Parts[3].VideoMetadata["fps"] == nil {
+		t.Fatalf("media metadata was not decoded: %#v", result.Parts[3])
+	}
+	if len(result.Parts[5].FunctionCall.PartialArgs) != 1 || result.Parts[5].FunctionCall.WillContinue == nil || !*result.Parts[5].FunctionCall.WillContinue {
+		t.Fatalf("partial function call was not decoded: %#v", result.Parts[5].FunctionCall)
+	}
+	if len(result.Parts[6].FunctionResponse.Parts) != 1 || result.Parts[6].FunctionResponse.Parts[0].InlineData == nil {
+		t.Fatalf("function response parts were not decoded: %#v", result.Parts[6].FunctionResponse)
+	}
+}
+
+func TestStreamDropsDefaultInitializedEmptyPart(t *testing.T) {
+	body := []byte(`[{"results":[{"data":{"promptFeedback":{"blockReason":"BLOCKED_REASON_UNSPECIFIED"},"candidates":[{"index":0,"content":{"role":"model","parts":[{"inlineData":{"mimeType":"","data":""},"fileData":{"mimeType":"","fileUri":""},"functionCall":{"name":""},"functionResponse":{"name":""},"executableCode":{"language":"","code":""},"codeExecutionResult":{"outcome":"","output":""},"videoMetadata":{"startOffset":"","endOffset":""}}]}}]}}]}]`)
+
+	var chunks []*CallResult
+	status, err := streamVertexResponse(strings.NewReader(string(body)), func(result *CallResult) error {
+		chunks = append(chunks, result)
+		return nil
+	})
+	if err != nil || status != 0 {
+		t.Fatalf("streamVertexResponse status=%d err=%v", status, err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("chunk count = %d, want 1 for prompt feedback", len(chunks))
+	}
+	if len(chunks[0].Parts) != 0 || len(chunks[0].Candidates) != 1 || len(chunks[0].Candidates[0].Parts) != 0 {
+		t.Fatalf("empty union part leaked into result: %+v", chunks[0])
+	}
+}
+
+func TestEmptyFileDataIsNotAssistantOutput(t *testing.T) {
+	part := model.VertexPart{FileData: map[string]interface{}{"mimeType": "image/png", "fileUri": ""}}
+	result := &CallResult{Parts: []model.VertexPart{part}}
+	if result.HasContent() || result.HasAssistantOutput() {
+		t.Fatalf("empty fileData was treated as assistant output: %+v", result)
+	}
+}
+
+func TestVertexPartOutputValidationMatchesGeminiRequirements(t *testing.T) {
+	tests := []struct {
+		name string
+		part model.VertexPart
+		want bool
+	}{
+		{name: "inline data missing mime", part: model.VertexPart{InlineData: &model.InlineData{Data: "aW1n"}}},
+		{name: "file data missing mime", part: model.VertexPart{FileData: map[string]interface{}{"fileUri": "gs://bucket/a.pdf"}}},
+		{name: "function response missing response", part: model.VertexPart{FunctionResponse: &model.FunctionResponse{Name: "lookup"}}},
+		{name: "executable code missing language", part: model.VertexPart{ExecutableCode: map[string]interface{}{"code": "print(1)"}}},
+		{name: "execution result missing outcome", part: model.VertexPart{CodeExecutionResult: map[string]interface{}{"output": "1"}}},
+		{name: "multiple data arms", part: model.VertexPart{Text: "x", InlineData: &model.InlineData{MimeType: "image/png", Data: "aW1n"}}},
+		{name: "bare empty thought flag", part: model.VertexPart{Thought: true}},
+		{name: "detached thought signature", part: model.VertexPart{Thought: true, ThoughtSignature: "c2ln"}, want: true},
+		{name: "thought text", part: model.VertexPart{Text: "thinking", Thought: true}, want: true},
+		{name: "valid file data", part: model.VertexPart{FileData: map[string]interface{}{"mimeType": "application/pdf", "fileUri": "gs://bucket/a.pdf"}}, want: true},
+		{name: "valid empty function response object", part: model.VertexPart{FunctionResponse: &model.FunctionResponse{Name: "lookup", Response: map[string]interface{}{}}}, want: true},
+		{name: "valid partial function call", part: model.VertexPart{FunctionCall: &model.FunctionCall{PartialArgs: []map[string]interface{}{{"jsonPath": "$.q", "boolValue": false}}}}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := vertexPartHasOutput(tt.part); got != tt.want {
+				t.Fatalf("vertexPartHasOutput() = %v, want %v for %#v", got, tt.want, tt.part)
+			}
+		})
+	}
+}
+
+func TestParseVertexResponseDropsSemanticallyEmptyCandidateMetadata(t *testing.T) {
+	body := []byte(`[{"results":[{"data":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"answer"}]},"groundingMetadata":{},"citationMetadata":{"citations":[]}}]}}]}]`)
+	result, status, err := parseVertexResponse(body)
+	if err != nil || status != 0 {
+		t.Fatalf("parseVertexResponse status=%d err=%v", status, err)
+	}
+	if len(result.Candidates) != 1 {
+		t.Fatalf("candidates = %#v", result.Candidates)
+	}
+	if result.GroundingMetadata != nil || result.Candidates[0].GroundingMetadata != nil {
+		t.Fatalf("empty grounding metadata survived parsing: %#v", result)
+	}
+	if result.Candidates[0].CitationMetadata != nil {
+		t.Fatalf("empty citation metadata survived parsing: %#v", result.Candidates[0].CitationMetadata)
 	}
 }
 
@@ -1255,6 +1337,8 @@ func TestBuildVertexBodyPassesNativeAdditionalVariables(t *testing.T) {
 			"cachedContent":    "projects/p/locations/global/cachedContents/c1",
 			"labels":           map[string]interface{}{"tenant": "test"},
 			"modelArmorConfig": map[string]interface{}{"promptTemplateName": "armor"},
+			"serviceTier":      "PRIORITY",
+			"store":            false,
 			"model":            "must-not-override",
 		},
 	})
@@ -1267,6 +1351,9 @@ func TestBuildVertexBodyPassesNativeAdditionalVariables(t *testing.T) {
 	}
 	if variables["modelArmorConfig"] == nil || variables["safetySettings"] != nil {
 		t.Fatalf("model armor/default safety conversion = %#v", variables)
+	}
+	if variables["serviceTier"] != "PRIORITY" || variables["store"] != false {
+		t.Fatalf("Gemini request options = %#v", variables)
 	}
 	if variables["model"] != "gemini-test" {
 		t.Fatalf("reserved model was overridden: %#v", variables["model"])

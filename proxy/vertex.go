@@ -144,17 +144,19 @@ func (r *CallResult) HasAssistantOutput() bool {
 		}
 	}
 	for _, part := range r.TextParts {
-		if part.Text != "" {
+		if part.Text != "" || strings.TrimSpace(part.ThoughtSignature) != "" {
 			return true
 		}
 	}
 	for _, part := range r.ImageParts {
-		if part.Data != "" {
+		if vertexInlineDataHasOutput(&part) {
 			return true
 		}
 	}
-	if len(r.FunctionCalls) > 0 {
-		return true
+	for i := range r.FunctionCalls {
+		if vertexFunctionCallHasOutput(&r.FunctionCalls[i]) {
+			return true
+		}
 	}
 	for _, candidate := range r.Candidates {
 		for _, part := range candidate.Parts {
@@ -163,30 +165,161 @@ func (r *CallResult) HasAssistantOutput() bool {
 			}
 		}
 		for _, part := range candidate.TextParts {
-			if part.Text != "" {
+			if part.Text != "" || strings.TrimSpace(part.ThoughtSignature) != "" {
 				return true
 			}
 		}
 		for _, part := range candidate.ImageParts {
-			if part.Data != "" {
+			if vertexInlineDataHasOutput(&part) {
 				return true
 			}
 		}
-		if len(candidate.FunctionCalls) > 0 {
-			return true
+		for i := range candidate.FunctionCalls {
+			if vertexFunctionCallHasOutput(&candidate.FunctionCalls[i]) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 func vertexPartHasOutput(part model.VertexPart) bool {
-	return part.Text != "" ||
-		(part.InlineData != nil && part.InlineData.Data != "") ||
-		len(part.FileData) > 0 ||
-		(part.FunctionCall != nil && part.FunctionCall.Name != "") ||
-		part.FunctionResponse != nil ||
-		len(part.ExecutableCode) > 0 ||
-		len(part.CodeExecutionResult) > 0
+	dataArms := 0
+	if part.Text != "" {
+		dataArms++
+	}
+	if vertexInlineDataHasOutput(part.InlineData) {
+		dataArms++
+	}
+	if vertexFileDataHasOutput(part.FileData) {
+		dataArms++
+	}
+	if vertexFunctionCallHasOutput(part.FunctionCall) {
+		dataArms++
+	}
+	if vertexFunctionResponseHasOutput(part.FunctionResponse) {
+		dataArms++
+	}
+	if vertexExecutableCodeHasOutput(part.ExecutableCode) {
+		dataArms++
+	}
+	if vertexCodeExecutionResultHasOutput(part.CodeExecutionResult) {
+		dataArms++
+	}
+	if dataArms == 0 && strings.TrimSpace(part.ThoughtSignature) != "" {
+		// A detached thought signature must remain round-trippable even when its
+		// text arm is empty. A bare thought=true flag carries no Part data and is
+		// dropped, matching the v1.0.3 behavior.
+		dataArms = 1
+	}
+	return dataArms == 1
+}
+
+func vertexPartUsesTextArm(part model.VertexPart) bool {
+	if part.Text != "" {
+		return true
+	}
+	if strings.TrimSpace(part.ThoughtSignature) == "" {
+		return false
+	}
+	return !vertexInlineDataHasOutput(part.InlineData) &&
+		!vertexFileDataHasOutput(part.FileData) &&
+		!vertexFunctionCallHasOutput(part.FunctionCall) &&
+		!vertexFunctionResponseHasOutput(part.FunctionResponse) &&
+		!vertexExecutableCodeHasOutput(part.ExecutableCode) &&
+		!vertexCodeExecutionResultHasOutput(part.CodeExecutionResult)
+}
+
+func vertexInlineDataHasOutput(inlineData *model.InlineData) bool {
+	return inlineData != nil &&
+		strings.TrimSpace(inlineData.MimeType) != "" &&
+		inlineData.Data != ""
+}
+
+func vertexFileDataHasOutput(fileData map[string]interface{}) bool {
+	mimeType := strings.TrimSpace(firstVertexStringValue(fileData, "mimeType", "mime_type"))
+	fileURI := strings.TrimSpace(firstVertexStringValue(fileData, "fileUri", "file_uri"))
+	return mimeType != "" && fileURI != ""
+}
+
+func vertexFunctionCallHasOutput(functionCall *model.FunctionCall) bool {
+	if functionCall == nil {
+		return false
+	}
+	if strings.TrimSpace(functionCall.ID) != "" || strings.TrimSpace(functionCall.Name) != "" || len(functionCall.Args) > 0 {
+		return true
+	}
+	for _, partialArg := range functionCall.PartialArgs {
+		if vertexPartialArgHasOutput(partialArg) {
+			return true
+		}
+	}
+	return functionCall.WillContinue != nil && *functionCall.WillContinue
+}
+
+func vertexPartialArgHasOutput(partialArg map[string]interface{}) bool {
+	if strings.TrimSpace(firstVertexStringValue(partialArg, "jsonPath", "json_path")) == "" {
+		return false
+	}
+	deltaArms := 0
+	for kind, keys := range [][]string{{"nullValue", "null_value"}, {"numberValue", "number_value"}, {"stringValue", "string_value"}, {"boolValue", "bool_value"}} {
+		for _, key := range keys {
+			value, ok := partialArg[key]
+			if !ok {
+				continue
+			}
+			if vertexPartialDeltaValueValid(kind, value) {
+				deltaArms++
+			}
+			break
+		}
+	}
+	return deltaArms == 1
+}
+
+func vertexPartialDeltaValueValid(kind int, value interface{}) bool {
+	switch kind {
+	case 0:
+		return value == nil
+	case 1:
+		switch value.(type) {
+		case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
+			return true
+		}
+	case 2:
+		_, ok := value.(string)
+		return ok
+	case 3:
+		_, ok := value.(bool)
+		return ok
+	}
+	return false
+}
+
+func vertexFunctionResponseHasOutput(functionResponse *model.FunctionResponse) bool {
+	return functionResponse != nil &&
+		strings.TrimSpace(functionResponse.Name) != "" &&
+		functionResponse.Response != nil
+}
+
+func vertexExecutableCodeHasOutput(executableCode map[string]interface{}) bool {
+	language := strings.TrimSpace(firstVertexStringValue(executableCode, "language"))
+	code := firstVertexStringValue(executableCode, "code")
+	return language != "" && !strings.EqualFold(language, "LANGUAGE_UNSPECIFIED") && code != ""
+}
+
+func vertexCodeExecutionResultHasOutput(result map[string]interface{}) bool {
+	outcome := strings.TrimSpace(firstVertexStringValue(result, "outcome"))
+	return outcome != "" && !strings.EqualFold(outcome, "OUTCOME_UNSPECIFIED")
+}
+
+func firstVertexStringValue(values map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value := stringValue(values, key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // CandidateResult retains candidate boundaries for native Gemini responses.
@@ -213,11 +346,40 @@ func (r *CallResult) HasContent() bool {
 	if r == nil {
 		return false
 	}
-	if len(r.Parts) > 0 || len(r.TextParts) > 0 || len(r.ImageParts) > 0 || len(r.FunctionCalls) > 0 || r.GroundingMetadata != nil {
+	for _, part := range r.Parts {
+		if vertexPartHasOutput(part) {
+			return true
+		}
+	}
+	if vertexSemanticSlicesHaveOutput(r.TextParts, r.ImageParts, r.FunctionCalls) || model.GroundingMetadataHasContent(r.GroundingMetadata) {
 		return true
 	}
 	for _, candidate := range r.Candidates {
-		if len(candidate.Parts) > 0 || len(candidate.TextParts) > 0 || len(candidate.ImageParts) > 0 || len(candidate.FunctionCalls) > 0 || candidate.GroundingMetadata != nil {
+		for _, part := range candidate.Parts {
+			if vertexPartHasOutput(part) {
+				return true
+			}
+		}
+		if vertexSemanticSlicesHaveOutput(candidate.TextParts, candidate.ImageParts, candidate.FunctionCalls) || model.GroundingMetadataHasContent(candidate.GroundingMetadata) {
+			return true
+		}
+	}
+	return false
+}
+
+func vertexSemanticSlicesHaveOutput(textParts []model.TextPart, imageParts []model.InlineData, functionCalls []model.FunctionCall) bool {
+	for _, part := range textParts {
+		if part.Text != "" || strings.TrimSpace(part.ThoughtSignature) != "" {
+			return true
+		}
+	}
+	for i := range imageParts {
+		if vertexInlineDataHasOutput(&imageParts[i]) {
+			return true
+		}
+	}
+	for i := range functionCalls {
+		if vertexFunctionCallHasOutput(&functionCalls[i]) {
 			return true
 		}
 	}
@@ -234,7 +396,7 @@ func (r *CallResult) HasMetadata() bool {
 	}
 	for _, candidate := range r.Candidates {
 		if candidate.FinishMessage != "" || len(candidate.SafetyRatings) > 0 ||
-			len(candidate.CitationMetadata) > 0 || len(candidate.URLContextMetadata) > 0 ||
+			model.CitationMetadataHasContent(candidate.CitationMetadata) || len(candidate.URLContextMetadata) > 0 ||
 			len(candidate.LogprobsResult) > 0 || candidate.AvgLogprobs != nil {
 			return true
 		}
@@ -2159,8 +2321,8 @@ func mergeCallResult(dst, src *CallResult) {
 	if src.Role != "" {
 		dst.Role = src.Role
 	}
-	if src.GroundingMetadata != nil {
-		dst.GroundingMetadata = src.GroundingMetadata
+	if groundingMetadata := model.NormalizeGroundingMetadata(src.GroundingMetadata); groundingMetadata != nil {
+		dst.GroundingMetadata = groundingMetadata
 	}
 	for _, candidate := range src.Candidates {
 		mergeCandidateResult(dst, candidate)
@@ -2186,6 +2348,8 @@ func mergeCallResult(dst, src *CallResult) {
 }
 
 func mergeCandidateResult(result *CallResult, incoming CandidateResult) {
+	incoming.GroundingMetadata = model.NormalizeGroundingMetadata(incoming.GroundingMetadata)
+	incoming.CitationMetadata = model.NormalizeCitationMetadata(incoming.CitationMetadata)
 	for i := range result.Candidates {
 		candidate := &result.Candidates[i]
 		if candidate.Index != incoming.Index {
@@ -2204,14 +2368,14 @@ func mergeCandidateResult(result *CallResult, incoming CandidateResult) {
 		if incoming.FinishMessage != "" {
 			candidate.FinishMessage = incoming.FinishMessage
 		}
-		if incoming.GroundingMetadata != nil {
-			candidate.GroundingMetadata = incoming.GroundingMetadata
+		if groundingMetadata := model.NormalizeGroundingMetadata(incoming.GroundingMetadata); groundingMetadata != nil {
+			candidate.GroundingMetadata = groundingMetadata
 		}
 		if len(incoming.SafetyRatings) > 0 {
 			candidate.SafetyRatings = incoming.SafetyRatings
 		}
-		if len(incoming.CitationMetadata) > 0 {
-			candidate.CitationMetadata = incoming.CitationMetadata
+		if citationMetadata := model.NormalizeCitationMetadata(incoming.CitationMetadata); len(citationMetadata) > 0 {
+			candidate.CitationMetadata = citationMetadata
 		}
 		if len(incoming.URLContextMetadata) > 0 {
 			candidate.URLContextMetadata = incoming.URLContextMetadata
@@ -2256,20 +2420,31 @@ func coalesceVertexParts(parts []model.VertexPart) []model.VertexPart {
 	}
 	merged := make([]model.VertexPart, 0, len(parts))
 	for _, part := range parts {
-		if !vertexPartHasOutput(part) && part.ThoughtSignature == "" && len(part.VideoMetadata) == 0 {
+		if !vertexPartHasOutput(part) {
 			continue
 		}
 		last := len(merged) - 1
-		if last >= 0 && part.Text != "" && merged[last].Text != "" &&
-			part.Thought == merged[last].Thought && part.ThoughtSignature == "" && merged[last].ThoughtSignature == "" &&
-			part.InlineData == nil && part.FunctionCall == nil && part.FunctionResponse == nil &&
-			len(part.FileData) == 0 && len(part.ExecutableCode) == 0 && len(part.CodeExecutionResult) == 0 {
+		if last >= 0 && vertexPartIsMergeableText(part) && vertexPartIsMergeableText(merged[last]) &&
+			part.Thought == merged[last].Thought {
 			merged[last].Text += part.Text
 			continue
 		}
 		merged = append(merged, part)
 	}
 	return merged
+}
+
+func vertexPartIsMergeableText(part model.VertexPart) bool {
+	return part.Text != "" &&
+		part.ThoughtSignature == "" &&
+		len(part.VideoMetadata) == 0 &&
+		len(part.MediaResolution) == 0 &&
+		!vertexInlineDataHasOutput(part.InlineData) &&
+		!vertexFileDataHasOutput(part.FileData) &&
+		!vertexFunctionCallHasOutput(part.FunctionCall) &&
+		!vertexFunctionResponseHasOutput(part.FunctionResponse) &&
+		!vertexExecutableCodeHasOutput(part.ExecutableCode) &&
+		!vertexCodeExecutionResultHasOutput(part.CodeExecutionResult)
 }
 
 func collectVertexStreamResult(elements []model.VertexResponseElement) (*CallResult, int, error) {
@@ -2362,9 +2537,9 @@ func collectVertexData(result *CallResult, data *model.VertexData) {
 			Index:              index,
 			FinishReason:       normalizeFinishReason(candidate.FinishReason),
 			FinishMessage:      candidate.FinishMessage,
-			GroundingMetadata:  candidate.GroundingMetadata,
+			GroundingMetadata:  model.NormalizeGroundingMetadata(candidate.GroundingMetadata),
 			SafetyRatings:      candidate.SafetyRatings,
-			CitationMetadata:   candidate.CitationMetadata,
+			CitationMetadata:   model.NormalizeCitationMetadata(candidate.CitationMetadata),
 			URLContextMetadata: candidate.URLContextMetadata,
 			LogprobsResult:     candidate.LogprobsResult,
 			AvgLogprobs:        candidate.AvgLogprobs,
@@ -2372,10 +2547,17 @@ func collectVertexData(result *CallResult, data *model.VertexData) {
 		if candidate.Content != nil {
 			candidateResult.Role = candidate.Content.Role
 			for _, part := range candidate.Content.Parts {
+				if !vertexPartHasOutput(part) {
+					// Vertex can return a default-initialized Part union when it has
+					// no candidate output (for example alongside an unspecified
+					// promptFeedback block reason). It is not a message part and
+					// must not leak into downstream streaming responses.
+					continue
+				}
 				candidateResult.Parts = append(candidateResult.Parts, part)
-				hasFunctionCall := part.FunctionCall != nil && part.FunctionCall.Name != ""
-				hasInlineData := part.InlineData != nil && part.InlineData.Data != ""
-				if part.Text != "" || (part.ThoughtSignature != "" && !hasFunctionCall && !hasInlineData) {
+				hasFunctionCall := vertexFunctionCallHasOutput(part.FunctionCall)
+				hasInlineData := vertexInlineDataHasOutput(part.InlineData)
+				if vertexPartUsesTextArm(part) {
 					candidateResult.TextParts = append(candidateResult.TextParts, model.TextPart{
 						Text:             part.Text,
 						Thought:          part.Thought,
@@ -2412,8 +2594,8 @@ func collectVertexData(result *CallResult, data *model.VertexData) {
 	if primary.FinishReason != "" {
 		result.FinishReason = primary.FinishReason
 	}
-	if primary.GroundingMetadata != nil {
-		result.GroundingMetadata = primary.GroundingMetadata
+	if groundingMetadata := model.NormalizeGroundingMetadata(primary.GroundingMetadata); groundingMetadata != nil {
+		result.GroundingMetadata = groundingMetadata
 	}
 }
 

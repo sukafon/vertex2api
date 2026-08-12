@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -153,7 +154,7 @@ func buildGeminiRequestOptions(req map[string]interface{}) *proxy.VertexRequestO
 	if toolConfig, ok := req["toolConfig"]; ok {
 		options.ToolConfig = toolConfig
 	}
-	for _, key := range []string{"cachedContent", "labels", "modelArmorConfig"} {
+	for _, key := range []string{"cachedContent", "labels", "modelArmorConfig", "serviceTier", "store"} {
 		if value, ok := req[key]; ok {
 			if options.AdditionalVariables == nil {
 				options.AdditionalVariables = make(map[string]interface{})
@@ -172,20 +173,21 @@ func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) m
 	if result == nil {
 		return response
 	}
+	promptFeedback := normalizeGeminiPromptFeedback(result.PromptFeedback)
+	promptWasBlocked := geminiPromptWasBlocked(promptFeedback)
 	candidates := make([]map[string]interface{}, 0, maxInt(1, len(result.Candidates)))
-	if len(result.Candidates) > 0 {
+	if !promptWasBlocked && len(result.Candidates) > 0 {
 		for _, candidate := range result.Candidates {
 			candidateResult := callResultFromCandidate(candidate)
 			candidateMap := buildGeminiCandidate(candidateResult, defaultStop)
-			candidateMap["index"] = candidate.Index
 			if candidate.FinishMessage != "" {
 				candidateMap["finishMessage"] = candidate.FinishMessage
 			}
-			if len(candidate.SafetyRatings) > 0 {
-				candidateMap["safetyRatings"] = candidate.SafetyRatings
+			if safetyRatings := normalizeGeminiSafetyRatings(candidate.SafetyRatings); len(safetyRatings) > 0 {
+				candidateMap["safetyRatings"] = safetyRatings
 			}
-			if len(candidate.CitationMetadata) > 0 {
-				candidateMap["citationMetadata"] = candidate.CitationMetadata
+			if citationMetadata := model.NormalizeCitationMetadata(candidate.CitationMetadata); len(citationMetadata) > 0 {
+				candidateMap["citationMetadata"] = citationMetadata
 			}
 			if len(candidate.URLContextMetadata) > 0 {
 				candidateMap["urlContextMetadata"] = candidate.URLContextMetadata
@@ -196,10 +198,20 @@ func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) m
 			if candidate.AvgLogprobs != nil {
 				candidateMap["avgLogprobs"] = *candidate.AvgLogprobs
 			}
+			if len(candidateMap) == 0 {
+				// Keep the v1.0.3 index behavior at the candidate envelope level:
+				// index accompanies meaningful candidate data, but is never emitted
+				// as a candidate by itself.
+				continue
+			}
+			candidateMap["index"] = candidate.Index
 			candidates = append(candidates, candidateMap)
 		}
-	} else if result.HasContent() || result.FinishReason != "" {
-		candidates = append(candidates, buildGeminiCandidate(result, defaultStop))
+	} else if !promptWasBlocked && (result.HasContent() || result.FinishReason != "") {
+		candidateMap := buildGeminiCandidate(result, defaultStop)
+		if len(candidateMap) > 0 {
+			candidates = append(candidates, candidateMap)
+		}
 	}
 	if len(candidates) > 0 {
 		response["candidates"] = candidates
@@ -213,11 +225,8 @@ func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) m
 	if result.ResponseID != "" {
 		response["responseId"] = result.ResponseID
 	}
-	if result.CreateTime != "" {
-		response["createTime"] = result.CreateTime
-	}
-	if len(result.PromptFeedback) > 0 {
-		response["promptFeedback"] = result.PromptFeedback
+	if len(promptFeedback) > 0 {
+		response["promptFeedback"] = promptFeedback
 	}
 	if len(result.ModelStatus) > 0 {
 		response["modelStatus"] = result.ModelStatus
@@ -225,158 +234,469 @@ func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) m
 	return response
 }
 
+func geminiPromptWasBlocked(promptFeedback map[string]interface{}) bool {
+	blockReason, _ := promptFeedback["blockReason"].(string)
+	return blockReason != ""
+}
+
+// normalizeGeminiPromptFeedback translates Vertex PromptFeedback into the
+// Gemini Developer API schema instead of exposing the upstream object as-is.
+func normalizeGeminiPromptFeedback(source map[string]interface{}) map[string]interface{} {
+	if len(source) == 0 {
+		return nil
+	}
+
+	result := make(map[string]interface{}, 2)
+	if blockReason := normalizeGeminiBlockReason(source["blockReason"]); blockReason != "" {
+		result["blockReason"] = blockReason
+	}
+	if safetyRatings := normalizeGeminiSafetyRatings(source["safetyRatings"]); len(safetyRatings) > 0 {
+		result["safetyRatings"] = safetyRatings
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func normalizeGeminiBlockReason(value interface{}) string {
+	blockReason, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	switch strings.ToUpper(strings.TrimSpace(blockReason)) {
+	case "", "BLOCK_REASON_UNSPECIFIED", "BLOCKED_REASON_UNSPECIFIED":
+		return ""
+	case "SAFETY", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY":
+		return strings.ToUpper(strings.TrimSpace(blockReason))
+	case "MODEL_ARMOR", "JAILBREAK":
+		// These reasons exist only in Vertex AI. OTHER is the closest valid
+		// Gemini Developer API value and still indicates that the prompt blocked.
+		return "OTHER"
+	default:
+		// Do not leak future Vertex-only enum names into the Gemini API surface.
+		return "OTHER"
+	}
+}
+
+func normalizeGeminiSafetyRatings(value interface{}) []map[string]interface{} {
+	var source []map[string]interface{}
+	switch ratings := value.(type) {
+	case []map[string]interface{}:
+		source = ratings
+	case []interface{}:
+		source = make([]map[string]interface{}, 0, len(ratings))
+		for _, value := range ratings {
+			if rating, ok := value.(map[string]interface{}); ok {
+				source = append(source, rating)
+			}
+		}
+	default:
+		return nil
+	}
+
+	result := make([]map[string]interface{}, 0, len(source))
+	for _, sourceRating := range source {
+		category := normalizeGeminiHarmCategory(sourceRating["category"])
+		probability := normalizeGeminiHarmProbability(sourceRating["probability"])
+		if category == "" || probability == "" {
+			continue
+		}
+		rating := map[string]interface{}{"category": category, "probability": probability}
+		if blocked, ok := sourceRating["blocked"].(bool); ok && blocked {
+			rating["blocked"] = true
+		}
+		result = append(result, rating)
+	}
+	return result
+}
+
+func normalizeGeminiHarmCategory(value interface{}) string {
+	category, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	category = strings.ToUpper(strings.TrimSpace(category))
+	if category == "" || category == "HARM_CATEGORY_UNSPECIFIED" {
+		return ""
+	}
+	if !isKnownGeminiHarmCategory(category) {
+		// Keep unknown non-default values so a newly added Gemini enum is not
+		// silently lost before this compatibility layer is updated.
+		log.Debug().Str("category", category).Msg("forwarding unknown Gemini harm category")
+	}
+	return category
+}
+
+func isKnownGeminiHarmCategory(category string) bool {
+	switch category {
+	case "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_DANGEROUS_CONTENT", "HARM_CATEGORY_HARASSMENT",
+		"HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_CIVIC_INTEGRITY", "HARM_CATEGORY_IMAGE_HATE",
+		"HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "HARM_CATEGORY_IMAGE_HARASSMENT",
+		"HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", "HARM_CATEGORY_JAILBREAK":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeGeminiHarmProbability(value interface{}) string {
+	probability, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	probability = strings.ToUpper(strings.TrimSpace(probability))
+	if probability == "" || probability == "HARM_PROBABILITY_UNSPECIFIED" {
+		return ""
+	}
+	if !isKnownGeminiHarmProbability(probability) {
+		log.Debug().Str("probability", probability).Msg("forwarding unknown Gemini harm probability")
+	}
+	return probability
+}
+
+func isKnownGeminiHarmProbability(probability string) bool {
+	switch probability {
+	case "NEGLIGIBLE", "LOW", "MEDIUM", "HIGH":
+		return true
+	default:
+		return false
+	}
+}
+
 func buildGeminiCandidate(result *proxy.CallResult, defaultStop bool) map[string]interface{} {
-	var parts []map[string]interface{}
-	if len(result.Parts) > 0 {
-		orderedParts := result.Parts
-		if defaultStop {
-			orderedParts = coalesceGeminiVertexParts(orderedParts)
-		}
-		for _, part := range orderedParts {
-			parts = append(parts, geminiPartMap(part))
-		}
-	}
-	if len(parts) == 0 {
-		textParts := result.TextParts
-		if defaultStop {
-			textParts = coalesceGeminiTextParts(textParts)
-		}
-
-		for _, textPart := range textParts {
-			part := map[string]interface{}{"text": textPart.Text}
-			if textPart.Thought {
-				part["thought"] = true
-			}
-			if textPart.ThoughtSignature != "" {
-				part["thoughtSignature"] = textPart.ThoughtSignature
-			}
-			parts = append(parts, part)
-		}
-		for _, img := range result.ImageParts {
-			parts = append(parts, map[string]interface{}{
-				"inlineData": map[string]interface{}{
-					"mimeType": img.MimeType,
-					"data":     img.Data,
-				},
-			})
-		}
-		for _, functionCall := range result.FunctionCalls {
-			call := map[string]interface{}{"name": functionCall.Name}
-			if functionCall.ID != "" {
-				call["id"] = functionCall.ID
-			}
-			if functionCall.Args != nil {
-				call["args"] = functionCall.Args
-			}
-			part := map[string]interface{}{"functionCall": call}
-			if functionCall.ThoughtSignature != "" {
-				part["thoughtSignature"] = functionCall.ThoughtSignature
-			}
-			parts = append(parts, part)
-		}
+	parts := buildCanonicalGeminiParts(result)
+	if defaultStop {
+		parts = coalesceCanonicalGeminiTextParts(parts)
 	}
 
-	role := result.Role
-	if role == "" {
-		role = "model"
-	}
-	candidate := map[string]interface{}{
-		"content": map[string]interface{}{
+	candidate := make(map[string]interface{}, 3)
+	if len(parts) > 0 {
+		candidate["content"] = map[string]interface{}{
 			"parts": parts,
-			"role":  role,
-		},
+			"role":  "model",
+		}
 	}
 	finishReason := result.FinishReason
-	if defaultStop && (finishReason == "" || finishReason == "FINISH_REASON_UNSPECIFIED") {
+	if defaultStop && len(parts) > 0 && (finishReason == "" || finishReason == "FINISH_REASON_UNSPECIFIED") {
 		finishReason = "STOP"
-	} else if !defaultStop && finishReason == "FINISH_REASON_UNSPECIFIED" {
+	} else if finishReason == "FINISH_REASON_UNSPECIFIED" {
 		finishReason = ""
 	}
 	if finishReason != "" {
 		candidate["finishReason"] = finishReason
 	}
-	if result.GroundingMetadata != nil {
-		candidate["groundingMetadata"] = result.GroundingMetadata
+	if groundingMetadata := model.NormalizeGroundingMetadata(result.GroundingMetadata); groundingMetadata != nil {
+		candidate["groundingMetadata"] = groundingMetadata
 	}
 
 	return candidate
 }
 
-func geminiPartMap(part model.VertexPart) map[string]interface{} {
-	result := make(map[string]interface{}, 4)
-	if part.Text != "" || (part.ThoughtSignature != "" && part.InlineData == nil && part.FunctionCall == nil && len(part.ExecutableCode) == 0 && len(part.CodeExecutionResult) == 0) {
-		result["text"] = part.Text
+func buildCanonicalGeminiParts(result *proxy.CallResult) []map[string]interface{} {
+	if result == nil {
+		return nil
 	}
-	if part.InlineData != nil {
-		result["inlineData"] = part.InlineData
+	parts := make([]map[string]interface{}, 0, maxInt(len(result.Parts), len(result.TextParts)+len(result.ImageParts)+len(result.FunctionCalls)))
+	if result.Parts != nil {
+		for _, sourcePart := range result.Parts {
+			if part, ok := canonicalGeminiPart(sourcePart); ok {
+				parts = append(parts, part)
+			}
+		}
+		return parts
 	}
-	if len(part.FileData) > 0 {
-		result["fileData"] = part.FileData
+
+	// Compatibility fallback for callers that still construct only the legacy
+	// semantic slices. Parsed Vertex responses always use the ordered Parts path.
+	for _, textPart := range result.TextParts {
+		if part, ok := canonicalGeminiPart(model.VertexPart{
+			Text:             textPart.Text,
+			Thought:          textPart.Thought,
+			ThoughtSignature: textPart.ThoughtSignature,
+		}); ok {
+			parts = append(parts, part)
+		}
 	}
-	if part.FunctionCall != nil {
-		result["functionCall"] = part.FunctionCall
+	for i := range result.ImageParts {
+		if part, ok := canonicalGeminiPart(model.VertexPart{InlineData: &result.ImageParts[i]}); ok {
+			parts = append(parts, part)
+		}
 	}
-	if part.FunctionResponse != nil {
-		result["functionResponse"] = part.FunctionResponse
+	for i := range result.FunctionCalls {
+		functionCall := result.FunctionCalls[i]
+		if part, ok := canonicalGeminiPart(model.VertexPart{
+			FunctionCall:     &functionCall,
+			ThoughtSignature: functionCall.ThoughtSignature,
+		}); ok {
+			parts = append(parts, part)
+		}
 	}
-	if len(part.ExecutableCode) > 0 {
-		result["executableCode"] = part.ExecutableCode
+	return parts
+}
+
+func canonicalGeminiPart(source model.VertexPart) (map[string]interface{}, bool) {
+	type dataArm struct {
+		name  string
+		value interface{}
 	}
-	if len(part.CodeExecutionResult) > 0 {
-		result["codeExecutionResult"] = part.CodeExecutionResult
+	arms := make([]dataArm, 0, 2)
+	if source.Text != "" {
+		arms = append(arms, dataArm{name: "text", value: source.Text})
 	}
-	if len(part.VideoMetadata) > 0 {
-		result["videoMetadata"] = part.VideoMetadata
+	if inlineData, ok := canonicalGeminiInlineData(source.InlineData); ok {
+		arms = append(arms, dataArm{name: "inlineData", value: inlineData})
 	}
-	if part.Thought {
-		result["thought"] = true
+	if fileData, ok := canonicalGeminiFileData(source.FileData); ok {
+		arms = append(arms, dataArm{name: "fileData", value: fileData})
 	}
-	if part.ThoughtSignature != "" {
-		result["thoughtSignature"] = part.ThoughtSignature
+	if functionCall, ok := canonicalGeminiFunctionCall(source.FunctionCall); ok {
+		arms = append(arms, dataArm{name: "functionCall", value: functionCall})
+	}
+	if functionResponse, ok := canonicalGeminiFunctionResponse(source.FunctionResponse); ok {
+		arms = append(arms, dataArm{name: "functionResponse", value: functionResponse})
+	}
+	if executableCode, ok := canonicalGeminiExecutableCode(source.ExecutableCode); ok {
+		arms = append(arms, dataArm{name: "executableCode", value: executableCode})
+	}
+	if codeExecutionResult, ok := canonicalGeminiCodeExecutionResult(source.CodeExecutionResult); ok {
+		arms = append(arms, dataArm{name: "codeExecutionResult", value: codeExecutionResult})
+	}
+	if len(arms) == 0 && strings.TrimSpace(source.ThoughtSignature) != "" {
+		arms = append(arms, dataArm{name: "text", value: ""})
+	}
+	if len(arms) != 1 {
+		// The Gemini Part data field is a oneof. Drop malformed upstream Parts
+		// rather than serializing a Vertex object containing multiple data arms.
+		return nil, false
+	}
+
+	part := map[string]interface{}{arms[0].name: arms[0].value}
+	if source.Thought {
+		part["thought"] = true
+	}
+	if source.ThoughtSignature != "" {
+		part["thoughtSignature"] = source.ThoughtSignature
+	}
+	if mediaResolution, ok := canonicalGeminiMediaResolution(source.MediaResolution); ok &&
+		(arms[0].name == "inlineData" || arms[0].name == "fileData") {
+		part["mediaResolution"] = mediaResolution
+	}
+	if videoMetadata, ok := canonicalGeminiVideoMetadata(source.VideoMetadata); ok &&
+		(arms[0].name == "inlineData" || arms[0].name == "fileData") {
+		part["videoMetadata"] = videoMetadata
+	}
+	return part, true
+}
+
+func canonicalGeminiInlineData(source *model.InlineData) (map[string]interface{}, bool) {
+	if source == nil || strings.TrimSpace(source.MimeType) == "" || source.Data == "" {
+		return nil, false
+	}
+	result := map[string]interface{}{
+		"mimeType": strings.TrimSpace(source.MimeType),
+		"data":     source.Data,
+	}
+	return result, true
+}
+
+func canonicalGeminiFileData(source map[string]interface{}) (map[string]interface{}, bool) {
+	mimeType := strings.TrimSpace(geminiMapString(source, "mimeType", "mime_type"))
+	fileURI := strings.TrimSpace(geminiMapString(source, "fileUri", "file_uri"))
+	if mimeType == "" || fileURI == "" {
+		return nil, false
+	}
+	return map[string]interface{}{"mimeType": mimeType, "fileUri": fileURI}, true
+}
+
+func canonicalGeminiFunctionCall(source *model.FunctionCall) (map[string]interface{}, bool) {
+	if source == nil {
+		return nil, false
+	}
+	result := make(map[string]interface{}, 3)
+	if id := strings.TrimSpace(source.ID); id != "" {
+		result["id"] = id
+	}
+	if name := strings.TrimSpace(source.Name); name != "" {
+		result["name"] = name
+	}
+	if source.Args != nil && (len(source.Args) > 0 || result["name"] != nil || result["id"] != nil) {
+		result["args"] = source.Args
+	}
+	// partialArgs and willContinue are Vertex-only streaming fields. The
+	// Gemini Developer API FunctionCall schema contains only id/name/args.
+	meaningful := result["id"] != nil || result["name"] != nil || len(source.Args) > 0
+	return result, meaningful
+}
+
+func canonicalGeminiFunctionResponse(source *model.FunctionResponse) (map[string]interface{}, bool) {
+	if source == nil || strings.TrimSpace(source.Name) == "" || source.Response == nil {
+		return nil, false
+	}
+	result := map[string]interface{}{
+		"name":     strings.TrimSpace(source.Name),
+		"response": source.Response,
+	}
+	if id := strings.TrimSpace(source.ID); id != "" {
+		result["id"] = id
+	}
+	parts := canonicalGeminiFunctionResponseParts(source.Parts)
+	if len(parts) > 0 {
+		result["parts"] = parts
+	}
+	return result, true
+}
+
+func canonicalGeminiFunctionResponseParts(source []model.FunctionResponsePart) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0, len(source))
+	for _, sourcePart := range source {
+		// Gemini FunctionResponsePart supports inlineData; its fileData arm is
+		// available only on Vertex AI and must not be exposed by this adapter.
+		if inlineData, ok := canonicalGeminiInlineData(sourcePart.InlineData); ok {
+			result = append(result, map[string]interface{}{"inlineData": inlineData})
+		}
 	}
 	return result
 }
 
-func coalesceGeminiVertexParts(parts []model.VertexPart) []model.VertexPart {
-	if len(parts) <= 1 {
-		return parts
+func canonicalGeminiExecutableCode(source map[string]interface{}) (map[string]interface{}, bool) {
+	language := strings.TrimSpace(geminiMapString(source, "language"))
+	code := geminiMapString(source, "code")
+	if language == "" || strings.EqualFold(language, "LANGUAGE_UNSPECIFIED") || code == "" {
+		return nil, false
 	}
-	result := make([]model.VertexPart, 0, len(parts))
-	for _, part := range parts {
-		last := len(result) - 1
-		if last >= 0 && part.Text != "" && result[last].Text != "" && part.Thought == result[last].Thought &&
-			part.ThoughtSignature == "" && result[last].ThoughtSignature == "" && part.InlineData == nil &&
-			part.FunctionCall == nil && part.FunctionResponse == nil && len(part.FileData) == 0 &&
-			len(part.ExecutableCode) == 0 && len(part.CodeExecutionResult) == 0 {
-			result[last].Text += part.Text
-			continue
-		}
-		result = append(result, part)
+	result := map[string]interface{}{"language": language, "code": code}
+	if id := strings.TrimSpace(geminiMapString(source, "id")); id != "" {
+		result["id"] = id
 	}
-	return result
+	return result, true
 }
 
-func coalesceGeminiTextParts(parts []model.TextPart) []model.TextPart {
+func canonicalGeminiCodeExecutionResult(source map[string]interface{}) (map[string]interface{}, bool) {
+	outcome := strings.TrimSpace(geminiMapString(source, "outcome"))
+	if outcome == "" || strings.EqualFold(outcome, "OUTCOME_UNSPECIFIED") {
+		return nil, false
+	}
+	result := map[string]interface{}{"outcome": outcome}
+	if output, ok := geminiMapValue(source, "output"); ok {
+		if text, valid := output.(string); valid {
+			result["output"] = text
+		}
+	}
+	if id := strings.TrimSpace(geminiMapString(source, "id")); id != "" {
+		result["id"] = id
+	}
+	return result, true
+}
+
+func canonicalGeminiVideoMetadata(source map[string]interface{}) (map[string]interface{}, bool) {
+	result := make(map[string]interface{}, 3)
+	if startOffset := strings.TrimSpace(geminiMapString(source, "startOffset", "start_offset")); startOffset != "" {
+		result["startOffset"] = startOffset
+	}
+	if endOffset := strings.TrimSpace(geminiMapString(source, "endOffset", "end_offset")); endOffset != "" {
+		result["endOffset"] = endOffset
+	}
+	if value, ok := geminiMapValue(source, "fps"); ok {
+		if fps, valid := geminiNumber(value); valid && fps > 0 && fps <= 24 {
+			result["fps"] = fps
+		}
+	}
+	return result, len(result) > 0
+}
+
+func canonicalGeminiMediaResolution(source map[string]interface{}) (map[string]interface{}, bool) {
+	level := strings.TrimSpace(geminiMapString(source, "level"))
+	if level == "" || strings.EqualFold(level, "MEDIA_RESOLUTION_UNSPECIFIED") {
+		return nil, false
+	}
+	return map[string]interface{}{"level": level}, true
+}
+
+func geminiMapString(source map[string]interface{}, keys ...string) string {
+	value, _ := geminiMapValue(source, keys...)
+	text, _ := value.(string)
+	return text
+}
+
+func geminiMapValue(source map[string]interface{}, keys ...string) (interface{}, bool) {
+	for _, key := range keys {
+		if value, ok := source[key]; ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func geminiNumber(value interface{}) (float64, bool) {
+	switch number := value.(type) {
+	case float64:
+		return number, true
+	case float32:
+		return float64(number), true
+	case int:
+		return float64(number), true
+	case int8:
+		return float64(number), true
+	case int16:
+		return float64(number), true
+	case int32:
+		return float64(number), true
+	case int64:
+		return float64(number), true
+	case uint:
+		return float64(number), true
+	case uint8:
+		return float64(number), true
+	case uint16:
+		return float64(number), true
+	case uint32:
+		return float64(number), true
+	case uint64:
+		return float64(number), true
+	case json.Number:
+		parsed, err := number.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func coalesceCanonicalGeminiTextParts(parts []map[string]interface{}) []map[string]interface{} {
 	if len(parts) <= 1 {
 		return parts
 	}
-
-	merged := make([]model.TextPart, 0, len(parts))
+	merged := make([]map[string]interface{}, 0, len(parts))
 	for _, part := range parts {
-		if part.Text == "" && part.ThoughtSignature == "" {
-			continue
-		}
-		lastIndex := len(merged) - 1
-		if lastIndex >= 0 &&
-			part.ThoughtSignature == "" &&
-			merged[lastIndex].ThoughtSignature == "" &&
-			merged[lastIndex].Thought == part.Thought {
-			merged[lastIndex].Text += part.Text
+		last := len(merged) - 1
+		if last >= 0 && canonicalGeminiTextPartIsMergeable(part) && canonicalGeminiTextPartIsMergeable(merged[last]) &&
+			geminiPartThought(part) == geminiPartThought(merged[last]) {
+			merged[last]["text"] = merged[last]["text"].(string) + part["text"].(string)
 			continue
 		}
 		merged = append(merged, part)
 	}
 	return merged
+}
+
+func canonicalGeminiTextPartIsMergeable(part map[string]interface{}) bool {
+	if _, ok := part["text"].(string); !ok {
+		return false
+	}
+	if _, ok := part["thoughtSignature"]; ok {
+		return false
+	}
+	for key := range part {
+		if key != "text" && key != "thought" {
+			return false
+		}
+	}
+	return true
+}
+
+func geminiPartThought(part map[string]interface{}) bool {
+	thought, _ := part["thought"].(bool)
+	return thought
 }
 
 func streamGeminiResponse(
@@ -401,14 +721,21 @@ func streamGeminiResponseWithProxy(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if result == nil || result.IsEmpty() {
+		if result == nil {
+			return nil
+		}
+		chunk := buildGeminiStreamResponse(result)
+		if len(chunk) == 0 {
+			// Upstream may send a candidate shell containing only default values
+			// and an unspecified promptFeedback. Normalize before deciding whether
+			// this is an observable Gemini SSE event.
 			return nil
 		}
 		if !committed {
 			setSSEHeaders(w)
 			committed = true
 		}
-		return writeGeminiStreamChunk(w, result)
+		return writeGeminiStreamChunk(w, chunk)
 	})
 	if err != nil {
 		if requestContextCanceled(ctx, err) {
@@ -430,8 +757,8 @@ func streamGeminiResponseWithProxy(
 	}
 }
 
-func writeGeminiStreamChunk(w http.ResponseWriter, result *proxy.CallResult) error {
-	data, _ := sonic.Marshal(buildGeminiStreamResponse(result))
+func writeGeminiStreamChunk(w http.ResponseWriter, chunk map[string]interface{}) error {
+	data, _ := sonic.Marshal(chunk)
 	if _, err := io.WriteString(w, "data: "); err != nil {
 		return err
 	}

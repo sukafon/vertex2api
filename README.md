@@ -31,7 +31,7 @@
 | 图片、文件、音频输入 | 原样 | 映射为 `inlineData`/`fileData` | 映射为 `inlineData`/`fileData` | image/document 映射为 `inlineData`/`fileData` |
 | 图片、文件、代码执行输出 | 原样 | 无标准等价项时转为可见 Markdown/data URL | 无标准等价项时转为可见 `output_text` | 转为协议合法的可见 text block/Markdown data URL |
 | Google Search grounding | 原样 | URL citation annotations | `web_search_call` 与 URL citation annotations | 不伪造缺少 Anthropic opaque 索引的 citation |
-| safety/prompt metadata | 原样 `promptFeedback`/finish reason | `content_filter` | refusal item | `end_turn`（不伪装成 Anthropic 模型的 `refusal`） |
+| safety/prompt metadata | 按 Gemini Developer API 规范化 `promptFeedback`/finish reason | `content_filter` | refusal item | `end_turn`（不伪装成 Anthropic 模型的 `refusal`） |
 | usage/cache/thinking token | 原样 metadata | 映射 usage details；缺失时标记估算 | 映射 input/output details；缺失时标记估算 | 映射 cache-read/thinking usage；缺失时标记估算 |
 
 “原样”指该匿名 Vertex GraphQL 上游实际返回或接受的字段；并不代表另一个协议中不存在的服务端资源（例如 OpenAI Files、container ID、持久化 response 或 Anthropic 加密搜索索引）可以被本地伪造。无法等价表达但仍可展示的输出会显式转为可见内容；会改变调用语义的请求字段则返回参数错误或在响应头中给出降级警告。
