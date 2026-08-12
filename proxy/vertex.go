@@ -243,57 +243,33 @@ func vertexFileDataHasOutput(fileData map[string]interface{}) bool {
 }
 
 func vertexFunctionCallHasOutput(functionCall *model.FunctionCall) bool {
-	if functionCall == nil {
-		return false
-	}
-	if strings.TrimSpace(functionCall.ID) != "" || strings.TrimSpace(functionCall.Name) != "" || len(functionCall.Args) > 0 {
-		return true
-	}
-	for _, partialArg := range functionCall.PartialArgs {
-		if vertexPartialArgHasOutput(partialArg) {
-			return true
-		}
-	}
-	return functionCall.WillContinue != nil && *functionCall.WillContinue
+	// All downstream compatibility protocols require a named function call.
+	// Vertex partialArgs/willContinue are transport-only streaming deltas and
+	// must not make an otherwise empty call observable outside the Vertex layer.
+	return functionCall != nil && strings.TrimSpace(functionCall.Name) != ""
 }
 
-func vertexPartialArgHasOutput(partialArg map[string]interface{}) bool {
-	if strings.TrimSpace(firstVertexStringValue(partialArg, "jsonPath", "json_path")) == "" {
-		return false
+func filterVertexOnlyFunctionCallFields(part model.VertexPart) model.VertexPart {
+	if part.FunctionCall == nil {
+		return part
 	}
-	deltaArms := 0
-	for kind, keys := range [][]string{{"nullValue", "null_value"}, {"numberValue", "number_value"}, {"stringValue", "string_value"}, {"boolValue", "bool_value"}} {
-		for _, key := range keys {
-			value, ok := partialArg[key]
-			if !ok {
-				continue
-			}
-			if vertexPartialDeltaValueValid(kind, value) {
-				deltaArms++
-			}
-			break
+	if strings.TrimSpace(part.FunctionCall.Name) == "" {
+		// Remove an empty or Vertex-partial-only function arm. Preserve a thought
+		// signature only when another valid data arm remains for it to annotate.
+		part.FunctionCall = nil
+		thoughtSignature := part.ThoughtSignature
+		part.ThoughtSignature = ""
+		if vertexPartHasOutput(part) {
+			part.ThoughtSignature = thoughtSignature
 		}
+		return part
 	}
-	return deltaArms == 1
-}
 
-func vertexPartialDeltaValueValid(kind int, value interface{}) bool {
-	switch kind {
-	case 0:
-		return value == nil
-	case 1:
-		switch value.(type) {
-		case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
-			return true
-		}
-	case 2:
-		_, ok := value.(string)
-		return ok
-	case 3:
-		_, ok := value.(bool)
-		return ok
-	}
-	return false
+	functionCall := *part.FunctionCall
+	functionCall.PartialArgs = nil
+	functionCall.WillContinue = nil
+	part.FunctionCall = &functionCall
+	return part
 }
 
 func vertexFunctionResponseHasOutput(functionResponse *model.FunctionResponse) bool {
@@ -2546,7 +2522,8 @@ func collectVertexData(result *CallResult, data *model.VertexData) {
 		}
 		if candidate.Content != nil {
 			candidateResult.Role = candidate.Content.Role
-			for _, part := range candidate.Content.Parts {
+			for _, sourcePart := range candidate.Content.Parts {
+				part := filterVertexOnlyFunctionCallFields(sourcePart)
 				if !vertexPartHasOutput(part) {
 					// Vertex can return a default-initialized Part union when it has
 					// no candidate output (for example alongside an unspecified

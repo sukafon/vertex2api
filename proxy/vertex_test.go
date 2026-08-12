@@ -247,7 +247,8 @@ func TestParseVertexResponsePreservesOrderedPartUnion(t *testing.T) {
 		`{"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"1"}},` +
 		`{"inlineData":{"mimeType":"image/png","data":"aW1n"},"videoMetadata":{"fps":2},"mediaResolution":{"level":"MEDIA_RESOLUTION_HIGH"},"thoughtSignature":"aW1nc2ln"},` +
 		`{"fileData":{"mimeType":"application/pdf","fileUri":"gs://bucket/a.pdf"}},` +
-		`{"functionCall":{"id":"call-1","name":"","partialArgs":[{"jsonPath":"$.q","stringValue":"x","willContinue":true}],"willContinue":true},"thoughtSignature":"Y2FsbHNpZw=="},` +
+		`{"functionCall":{"id":"call-1","name":"lookup","args":{"q":"x"},"partialArgs":[{"jsonPath":"$.q","stringValue":"x","willContinue":true}],"willContinue":true},"thoughtSignature":"Y2FsbHNpZw=="},` +
+		`{"functionCall":{"partialArgs":[{"jsonPath":"$.ignored","stringValue":"vertex-only"}],"willContinue":true},"thoughtSignature":"dmVydGV4LW9ubHk="},` +
 		`{"functionResponse":{"id":"call-1","name":"lookup","response":{"ok":true},"parts":[{"inlineData":{"mimeType":"image/png","data":"cmVzdWx0"}}]}}` +
 		`]}}]}}]}]`)
 	result, status, err := parseVertexResponse(body)
@@ -266,8 +267,15 @@ func TestParseVertexResponsePreservesOrderedPartUnion(t *testing.T) {
 	if result.Parts[3].MediaResolution["level"] != "MEDIA_RESOLUTION_HIGH" || result.Parts[3].VideoMetadata["fps"] == nil {
 		t.Fatalf("media metadata was not decoded: %#v", result.Parts[3])
 	}
-	if len(result.Parts[5].FunctionCall.PartialArgs) != 1 || result.Parts[5].FunctionCall.WillContinue == nil || !*result.Parts[5].FunctionCall.WillContinue {
-		t.Fatalf("partial function call was not decoded: %#v", result.Parts[5].FunctionCall)
+	if len(result.Parts[5].FunctionCall.PartialArgs) != 0 || result.Parts[5].FunctionCall.WillContinue != nil {
+		t.Fatalf("Vertex-only function call fields leaked: %#v", result.Parts[5].FunctionCall)
+	}
+	if result.Parts[5].FunctionCall.Name != "lookup" || result.Parts[5].FunctionCall.Args["q"] != "x" {
+		t.Fatalf("standard function call fields were lost: %#v", result.Parts[5].FunctionCall)
+	}
+	if len(result.FunctionCalls) != 1 || len(result.Candidates[0].FunctionCalls) != 1 ||
+		result.FunctionCalls[0].Name != "lookup" || len(result.FunctionCalls[0].PartialArgs) != 0 || result.FunctionCalls[0].WillContinue != nil {
+		t.Fatalf("shared function calls were not filtered: top=%#v candidate=%#v", result.FunctionCalls, result.Candidates[0].FunctionCalls)
 	}
 	if len(result.Parts[6].FunctionResponse.Parts) != 1 || result.Parts[6].FunctionResponse.Parts[0].InlineData == nil {
 		t.Fatalf("function response parts were not decoded: %#v", result.Parts[6].FunctionResponse)
@@ -318,7 +326,9 @@ func TestVertexPartOutputValidationMatchesGeminiRequirements(t *testing.T) {
 		{name: "thought text", part: model.VertexPart{Text: "thinking", Thought: true}, want: true},
 		{name: "valid file data", part: model.VertexPart{FileData: map[string]interface{}{"mimeType": "application/pdf", "fileUri": "gs://bucket/a.pdf"}}, want: true},
 		{name: "valid empty function response object", part: model.VertexPart{FunctionResponse: &model.FunctionResponse{Name: "lookup", Response: map[string]interface{}{}}}, want: true},
-		{name: "valid partial function call", part: model.VertexPart{FunctionCall: &model.FunctionCall{PartialArgs: []map[string]interface{}{{"jsonPath": "$.q", "boolValue": false}}}}, want: true},
+		{name: "Vertex-only partial function call", part: model.VertexPart{FunctionCall: &model.FunctionCall{PartialArgs: []map[string]interface{}{{"jsonPath": "$.q", "boolValue": false}}}}},
+		{name: "function call missing name", part: model.VertexPart{FunctionCall: &model.FunctionCall{ID: "call-1", Args: map[string]interface{}{"q": "x"}}}},
+		{name: "valid named function call", part: model.VertexPart{FunctionCall: &model.FunctionCall{Name: "lookup", Args: map[string]interface{}{"q": "x"}}}, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
