@@ -17,6 +17,7 @@ import (
 )
 
 const code3RequestLogFilename = "code3_request_bodies.log"
+const redactedCode3RequestValue = "[REDACTED]"
 
 type code3RequestLog struct {
 	path string
@@ -72,13 +73,9 @@ func (l *code3RequestLog) capture(err error, requestBody []byte) (bool, error) {
 		return false, nil
 	}
 
-	body := json.RawMessage(bytes.Clone(requestBody))
-	if !json.Valid(body) {
-		encodedBody, marshalErr := json.Marshal(string(requestBody))
-		if marshalErr != nil {
-			return false, fmt.Errorf("encode non-JSON request body: %w", marshalErr)
-		}
-		body = encodedBody
+	body, redactErr := redactCode3RequestBody(requestBody)
+	if redactErr != nil {
+		return false, fmt.Errorf("redact Code 3 request body: %w", redactErr)
 	}
 
 	entry := code3RequestLogEntry{
@@ -109,6 +106,38 @@ func (l *code3RequestLog) capture(err error, requestBody []byte) (bool, error) {
 		return false, fmt.Errorf("close Code 3 request log: %w", closeErr)
 	}
 	return true, nil
+}
+
+func redactCode3RequestBody(requestBody []byte) (json.RawMessage, error) {
+	var body interface{}
+	if err := json.Unmarshal(bytes.Clone(requestBody), &body); err != nil {
+		// Do not persist an unparseable body because its secrets cannot be
+		// redacted reliably.
+		return json.RawMessage(`"[UNPARSEABLE REQUEST BODY OMITTED]"`), nil
+	}
+	redactCode3RequestValue(body)
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(encoded), nil
+}
+
+func redactCode3RequestValue(value interface{}) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, child := range typed {
+			if strings.EqualFold(strings.TrimSpace(key), "recaptchaToken") {
+				typed[key] = redactedCode3RequestValue
+				continue
+			}
+			redactCode3RequestValue(child)
+		}
+	case []interface{}:
+		for _, child := range typed {
+			redactCode3RequestValue(child)
+		}
+	}
 }
 
 func code3ErrorAlreadyLogged(path, errorMessage string) (bool, error) {

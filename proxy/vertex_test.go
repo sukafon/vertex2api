@@ -1184,15 +1184,15 @@ func TestNormalizeContentsOrdersParallelResponsesByFunctionCall(t *testing.T) {
 		{
 			"role": "model",
 			"parts": []map[string]interface{}{
-				{"functionCall": map[string]interface{}{"id": "call-1", "name": "first", "args": map[string]interface{}{}}},
-				{"functionCall": map[string]interface{}{"id": "call-2", "name": "second", "args": map[string]interface{}{}}},
+				{"functionCall": map[string]interface{}{"id": "call-1", "name": "lookup", "args": map[string]interface{}{"query": "first"}}},
+				{"functionCall": map[string]interface{}{"id": "call-2", "name": "lookup", "args": map[string]interface{}{"query": "second"}}},
 			},
 		},
 		{
 			"role": "user",
 			"parts": []map[string]interface{}{
-				{"functionResponse": map[string]interface{}{"id": "call-2", "name": "second", "response": map[string]interface{}{"ok": true}}},
-				{"functionResponse": map[string]interface{}{"id": "call-1", "name": "first", "response": map[string]interface{}{"ok": true}}},
+				{"functionResponse": map[string]interface{}{"id": "call-2", "name": "lookup", "response": map[string]interface{}{"value": "second"}}},
+				{"functionResponse": map[string]interface{}{"id": "call-1", "name": "lookup", "response": map[string]interface{}{"value": "first"}}},
 			},
 		},
 	}

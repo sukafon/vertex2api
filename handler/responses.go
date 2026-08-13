@@ -62,7 +62,7 @@ func (api *ResponsesAPI) Responses() http.Handler {
 			writeResponseRequestError(w, err.Error())
 			return
 		}
-		chatReq, compactItem, err := api.maybeCompactRequest(r.Context(), req, chatReq)
+		chatReq, compactItem, compactUsage, err := api.maybeCompactRequest(r.Context(), req, chatReq)
 		if err != nil {
 			if requestContextCanceled(r.Context(), err) {
 				return
@@ -87,7 +87,7 @@ func (api *ResponsesAPI) Responses() http.Handler {
 				WriteJSON(w, http.StatusInternalServerError, publicServerErrorResponse(err))
 				return
 			}
-			api.streamResponse(w, r, req, chatReq, compactItem, toolKinds, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
+			api.streamResponse(w, r, req, chatReq, compactItem, compactUsage, toolKinds, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
 				return api.vp.StreamWithTokenRequireAssistantOutputContext(ctx, bodyJSON, tokenLease, onChunk)
 			})
 			return
@@ -105,7 +105,7 @@ func (api *ResponsesAPI) Responses() http.Handler {
 			return
 		}
 
-		usage, estimated := responseUsage(chatReq, result)
+		usage, estimated := responseUsageWithContribution(chatReq, result, compactUsage)
 		if estimated {
 			w.Header().Set("X-Usage-Estimated", "true")
 		}
@@ -872,10 +872,26 @@ func responseOutputContent(value interface{}) interface{} {
 }
 
 func responseUsage(req model.ChatCompletionRequest, result *proxy.CallResult) (model.ResponseUsage, bool) {
+	return responseUsageWithContribution(req, result, nil)
+}
+
+func responseUsageWithContribution(
+	req model.ChatCompletionRequest,
+	result *proxy.CallResult,
+	contribution *openAIUsageContribution,
+) (model.ResponseUsage, bool) {
 	usage, estimated := openAIUsage(req, result)
+	if contribution != nil {
+		usage = combineOpenAIUsage(contribution.usage, usage)
+		estimated = estimated || contribution.estimated
+	}
+	return responseUsageFromOpenAI(usage), estimated
+}
+
+func responseUsageFromOpenAI(usage *model.Usage) model.ResponseUsage {
 	converted := model.ResponseUsage{}
 	if usage == nil {
-		return converted, estimated
+		return converted
 	}
 	converted.InputTokens = usage.PromptTokens
 	converted.OutputTokens = usage.CompletionTokens
@@ -886,7 +902,7 @@ func responseUsage(req model.ChatCompletionRequest, result *proxy.CallResult) (m
 	if usage.CompletionTokensDetails != nil {
 		converted.OutputTokensDetails.ReasoningTokens = usage.CompletionTokensDetails.ReasoningTokens
 	}
-	return converted, estimated
+	return converted
 }
 
 func buildResponseOutput(result *proxy.CallResult, toolBindings responseToolBindings) []map[string]interface{} {
@@ -1130,7 +1146,11 @@ func newResponseObjectID(prefix string) string {
 	return prefix + "_" + base64.RawURLEncoding.EncodeToString(data)
 }
 
-func (api *ResponsesAPI) maybeCompactRequest(ctx context.Context, req model.ResponseRequest, chatReq model.ChatCompletionRequest) (model.ChatCompletionRequest, map[string]interface{}, error) {
+func (api *ResponsesAPI) maybeCompactRequest(
+	ctx context.Context,
+	req model.ResponseRequest,
+	chatReq model.ChatCompletionRequest,
+) (model.ChatCompletionRequest, map[string]interface{}, *openAIUsageContribution, error) {
 	threshold := 0
 	for _, entry := range req.ContextManagement {
 		if entry.Type == "compaction" {
@@ -1138,21 +1158,23 @@ func (api *ResponsesAPI) maybeCompactRequest(ctx context.Context, req model.Resp
 		}
 	}
 	if threshold == 0 || estimateOpenAIPromptTokens(chatReq) < threshold {
-		return chatReq, nil, nil
+		return chatReq, nil, nil, nil
 	}
-	summary, _, _, err := api.compactMessages(ctx, req.Model, chatReq.Messages)
+	summary, summaryReq, result, err := api.compactMessages(ctx, req.Model, chatReq.Messages)
 	if err != nil {
-		return model.ChatCompletionRequest{}, nil, err
+		return model.ChatCompletionRequest{}, nil, nil, err
 	}
 	item, err := api.newCompactionItem(req.Model, summary)
 	if err != nil {
-		return model.ChatCompletionRequest{}, nil, err
+		return model.ChatCompletionRequest{}, nil, nil, err
 	}
+	usage, estimated := openAIUsage(summaryReq, result)
+	contribution := &openAIUsageContribution{usage: usage, estimated: estimated}
 	instructions := retainResponseInstructions(chatReq.Messages)
 	retained := retainLatestResponseTurn(chatReq.Messages)
 	chatReq.Messages = append(instructions, model.ChatMessage{Role: "user", Content: "[Compacted historical conversation state]\n" + summary})
 	chatReq.Messages = append(chatReq.Messages, retained...)
-	return chatReq, item, nil
+	return chatReq, item, contribution, nil
 }
 
 func retainResponseInstructions(messages []model.ChatMessage) []model.ChatMessage {
@@ -1262,9 +1284,13 @@ func (codec *responseCompactCodec) open(value string) (compactPayload, error) {
 	if !strings.HasPrefix(value, compactContentPrefix) {
 		return compactPayload{}, errors.New("unknown compaction format")
 	}
-	data, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, compactContentPrefix))
+	encoded := strings.TrimPrefix(value, compactContentPrefix)
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil || len(data) < codec.aead.NonceSize() {
 		return compactPayload{}, errors.New("invalid compaction payload")
+	}
+	if base64.RawURLEncoding.EncodeToString(data) != encoded {
+		return compactPayload{}, errors.New("non-canonical compaction payload")
 	}
 	nonce, ciphertext := data[:codec.aead.NonceSize()], data[codec.aead.NonceSize():]
 	plain, err := codec.aead.Open(nil, nonce, ciphertext, []byte(compactAAD))
@@ -1287,9 +1313,14 @@ func (api *ResponsesAPI) streamResponse(
 	req model.ResponseRequest,
 	chatReq model.ChatCompletionRequest,
 	compactItem map[string]interface{},
+	compactUsage *openAIUsageContribution,
 	toolBindings responseToolBindings,
 	stream func(context.Context, func(*proxy.CallResult) error) error,
 ) {
+	declareUsageEstimateTrailer(w)
+	if compactUsage != nil && compactUsage.estimated {
+		w.Header().Set("X-Usage-Estimated", "true")
+	}
 	setSSEHeaders(w)
 	responseID := newResponseObjectID("resp")
 	sequence := int64(0)
@@ -1320,6 +1351,7 @@ func (api *ResponsesAPI) streamResponse(
 	}
 
 	aggregate := &proxy.CallResult{}
+	usageRevision := &streamUsageRevision{}
 	commentaryID := ""
 	commentaryIndex := -1
 	var commentaryBuilder strings.Builder
@@ -1369,6 +1401,7 @@ func (api *ResponsesAPI) streamResponse(
 		if result == nil || result.IsEmpty() {
 			return nil
 		}
+		usageRevision.observe(result)
 		accumulateCallResult(aggregate, result)
 		content, reasoning := buildStreamResponseContent(result)
 		if reasoning != "" {
@@ -1535,7 +1568,9 @@ func (api *ResponsesAPI) streamResponse(
 		output = append(output, searchCall)
 	}
 
-	usage, _ := responseUsage(chatReq, aggregate)
+	snapshot := usageSnapshot(aggregate, usageRevision)
+	usage, estimated := responseUsageWithContribution(chatReq, &snapshot, compactUsage)
+	finishUsageEstimate(w, estimated)
 	if len(buildResponseOutput(aggregate, toolBindings)) == 0 {
 		log.Error().
 			Str("model", req.Model).

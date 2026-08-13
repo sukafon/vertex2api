@@ -99,6 +99,19 @@ func setSSEHeaders(w http.ResponseWriter) {
 	header.Set("X-Accel-Buffering", "no")
 }
 
+func declareUsageEstimateTrailer(w http.ResponseWriter) {
+	if w == nil {
+		return
+	}
+	w.Header().Add("Trailer", "X-Usage-Estimated")
+}
+
+func finishUsageEstimate(w http.ResponseWriter, estimated bool) {
+	if w != nil && estimated {
+		w.Header().Set("X-Usage-Estimated", "true")
+	}
+}
+
 func flushResponse(w http.ResponseWriter) error {
 	return http.NewResponseController(w).Flush()
 }

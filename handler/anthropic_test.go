@@ -326,6 +326,31 @@ func TestBuildAnthropicRequestOptionsConvertsToolsAndChoice(t *testing.T) {
 	}
 }
 
+func TestBuildAnthropicRequestOptionsForcesNativeWebSearchWithoutFunctionConfig(t *testing.T) {
+	options := buildAnthropicRequestOptions(model.AnthropicMessageRequest{
+		Tools: []map[string]interface{}{
+			{"name": "lookup", "input_schema": map[string]interface{}{"type": "object"}},
+			{"type": "web_search_20250305", "name": "web_search"},
+			{"type": "code_execution"},
+		},
+		ToolChoice: map[string]interface{}{"type": "tool", "name": "web_search"},
+	})
+
+	if options == nil {
+		t.Fatal("options should not be nil")
+	}
+	tools := options.Tools.([]interface{})
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want only selected native tool", tools)
+	}
+	if _, ok := tools[0].(map[string]interface{})["googleSearch"]; !ok {
+		t.Fatalf("selected tool = %#v, want googleSearch", tools[0])
+	}
+	if options.ToolConfig != nil {
+		t.Fatalf("toolConfig = %#v, want nil for native tool choice", options.ToolConfig)
+	}
+}
+
 func TestBuildAnthropicContentIncludesToolUse(t *testing.T) {
 	content := buildAnthropicContent(&proxy.CallResult{
 		TextParts: []model.TextPart{{Text: "checking"}},
@@ -380,6 +405,39 @@ func TestStreamAnthropicResponseWritesMessageEvents(t *testing.T) {
 	}
 }
 
+func TestStreamAnthropicResponseInvalidatesStaleOutputUsage(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	rec := httptest.NewRecorder()
+	messageReq := model.AnthropicMessageRequest{
+		Model:    "gemini-test",
+		Messages: []model.AnthropicInputMessage{{Role: "user", Content: "hello"}},
+	}
+
+	streamAnthropicResponse(rec, req, messageReq, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+		if err := onChunk(&proxy.CallResult{
+			TextParts: []model.TextPart{{Text: "a"}},
+			UsageMetadata: map[string]interface{}{
+				"promptTokenCount": float64(7), "candidatesTokenCount": float64(1), "totalTokenCount": float64(8),
+			},
+		}); err != nil {
+			return err
+		}
+		return onChunk(&proxy.CallResult{TextParts: []model.TextPart{{Text: strings.Repeat("later output ", 20)}}, FinishReason: "STOP"})
+	})
+
+	events := decodeSSEEventObjects(t, rec.Body.String(), "message_delta")
+	if len(events) != 1 {
+		t.Fatalf("message_delta events = %d, want 1\n%s", len(events), rec.Body.String())
+	}
+	usage := events[0]["usage"].(map[string]interface{})
+	if got := int(usage["output_tokens"].(float64)); got <= 1 {
+		t.Fatalf("output_tokens = %d, stale upstream value was retained", got)
+	}
+	if got := rec.Header().Get("X-Usage-Estimated"); got != "true" {
+		t.Fatalf("X-Usage-Estimated = %q, want true", got)
+	}
+}
+
 func TestStreamAnthropicResponseKeepsTextInOneBlockAcrossChunks(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/messages", nil)
 	rec := httptest.NewRecorder()
@@ -431,6 +489,11 @@ func TestStreamAnthropicResponseHandlesCumulativeTextChunks(t *testing.T) {
 	}
 	if got := strings.Count(body, `"text":"hello world"`); got != 0 {
 		t.Fatalf("stream body repeated cumulative text: %s", body)
+	}
+	events := decodeSSEEventObjects(t, body, "message_delta")
+	usage := events[0]["usage"].(map[string]interface{})
+	if got, want := int(usage["output_tokens"].(float64)), estimateTextTokens("hello world"); got != want {
+		t.Fatalf("output_tokens = %d, want emitted-delta estimate %d", got, want)
 	}
 }
 

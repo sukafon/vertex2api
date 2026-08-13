@@ -62,7 +62,9 @@ func run() error {
 		Int("write_timeout_seconds", cfg.WriteTimeoutSeconds).
 		Bool("auto_fetch_models", cfg.AutoFetchModels).
 		Bool("allow_custom_model_names", cfg.AllowCustomModelNames).
+		Bool("gemini_strict_alt_sse", cfg.GeminiStrictAltSSE).
 		Bool("reject_chat_liveness_probes", cfg.RejectChatLivenessProbe).
+		Bool("respond_chat_liveness_probes", cfg.ReplyChatLivenessProbe).
 		Bool("redact_upstream_responses", cfg.RedactUpstreamResponses).
 		Msg("Configuration loaded")
 
@@ -118,7 +120,7 @@ func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Han
 	responsesAPI := handler.NewResponsesAPI(vertexProxy, cfg.AllowCustomModelNames, strings.Join(cfg.APIKeys, "\x00"))
 	mux.Handle("POST /v1/messages", handler.AnthropicMessages(vertexProxy, cfg.AllowCustomModelNames))
 	mux.Handle("POST /v1/messages/count_tokens", handler.AnthropicCountTokens(cfg.AllowCustomModelNames))
-	mux.Handle("POST /v1/chat/completions", handler.ChatCompletions(vertexProxy, cfg.AllowCustomModelNames, cfg.RejectChatLivenessProbe))
+	mux.Handle("POST /v1/chat/completions", handler.ChatCompletions(vertexProxy, cfg.AllowCustomModelNames, cfg.RejectChatLivenessProbe, cfg.ReplyChatLivenessProbe))
 	mux.Handle("POST /v1/responses", responsesAPI.Responses())
 	mux.Handle("POST /v1/responses/compact", responsesAPI.Compact())
 	mux.Handle("POST /v1/images/generations", handler.ImageGenerations(vertexProxy, cfg.AllowCustomModelNames))
@@ -127,7 +129,7 @@ func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Han
 	mux.Handle("GET /v1/models/{modelID}", handler.RetrieveModel())
 	mux.Handle("GET /v1/stats", handler.Stats(cfg))
 
-	geminiHandler := handler.GeminiGenerate(vertexProxy, cfg.AllowCustomModelNames)
+	geminiHandler := handler.GeminiGenerate(vertexProxy, cfg.AllowCustomModelNames, cfg.GeminiStrictAltSSE)
 	mux.Handle("POST /v1beta/models/{modelAction}", geminiHandler)
 	mux.Handle("POST /v1beta1/models/{modelAction}", geminiHandler)
 	mux.Handle("POST /v1/models/{modelAction}", geminiHandler)

@@ -98,6 +98,20 @@ curl 'http://127.0.0.1:8080/v1beta/models/gemini-3.6-flash:generateContent' \
   -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
 ```
 
+Gemini SSE 流式请求应显式携带 `alt=sse`：
+
+```bash
+curl --no-buffer 'http://127.0.0.1:8080/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse' \
+  -H 'x-goog-api-key: your-random-secret' \
+  -H 'Accept: text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
+```
+
+启用 `GEMINI_STRICT_ALT_SSE=true` 后，缺少 `alt=sse` 的 `streamGenerateContent` 会按非流模式等待完成，再一次性返回单个 `application/json` 响应对象；关闭时继续兼容不带该参数的旧 SSE 客户端。规范的非流调用仍应使用 `generateContent`。
+
+Gemini SSE 的每个普通消息块都会携带当前累计的 `usageMetadata`、`modelVersion` 和 `responseId`。每个块优先采用与当前累计输出时点匹配的最近上游 usage；上游仅提供部分字段时由项目内置算法补齐，上游未提供或其后又产生新输出时则按该块对应的请求和累计输出重新估算，后续总量不会倒灌到先前块。末尾仅含 `thoughtSignature` 和空文本的传输片段会并入最后一个实际消息；如果整条流只有签名，则签名会附着到结束 candidate，避免产生空普通块。结束 candidate 携带候选索引和 `finishReason`，并继续携带相同响应级元数据。同一流在首个下游块实际发出时锁定此前观察到的首个上游真实 `modelVersion` 和 `responseId`；匿名上游未提供时，分别回退为请求模型名和一次性生成的会话响应 ID，整个流保持不变。
+
 ### Anthropic 示例
 
 ```bash
@@ -123,7 +137,9 @@ curl http://127.0.0.1:8080/v1/messages \
 | `TZ` | `Asia/Shanghai` | 日志和自动拉取任务使用的时区；可填写其他 IANA 时区 |
 | `ALLOW_UNAUTHENTICATED` | `false` | 显式允许无鉴权运行，仅建议本地开发使用 |
 | `ALLOW_CUSTOM_MODEL_NAMES` | `false` | 是否允许调用不在当前模型目录中的模型名称；开启后仍拒绝路径分隔符和 `..` 序列 |
+| `GEMINI_STRICT_ALT_SSE` | `false` | 是否严格要求 Gemini `streamGenerateContent` 使用 `alt=sse` 才返回 SSE；开启后缺少或使用其他 `alt` 值会等待完成并返回单个完整 JSON 响应对象 |
 | `REJECT_CHAT_LIVENESS_PROBES` | `false` | 是否拒绝仅包含单条 `"hi"` 用户消息的 OpenAI Chat 请求；开启后应使用 `GET /health` 验活 |
+| `RESPOND_CHAT_LIVENESS_PROBES` | `false` | 是否对上述验活请求在本地构造协议合法的正常响应并跳过上游；与拒绝开关同时开启时本项优先 |
 | `STATS_KEY` | 无 | `/v1/stats` 独立密钥；留空时该接口不可用 |
 | `HOST` | `0.0.0.0` | 服务监听地址，例如 `0.0.0.0` 或 `127.0.0.1` |
 | `PORT` | `8080` | 监听端口 |

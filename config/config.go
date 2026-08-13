@@ -24,7 +24,9 @@ type Config struct {
 	APIKeyFile              string
 	AllowUnauthenticated    bool
 	AllowCustomModelNames   bool
+	GeminiStrictAltSSE      bool
 	RejectChatLivenessProbe bool
+	ReplyChatLivenessProbe  bool
 	StatsKey                string
 	Host                    string
 	Port                    string
@@ -61,7 +63,9 @@ func Load() *Config {
 		APIKeyFile:              strings.TrimSpace(getEnv("API_KEY_FILE", defaultAPIKeyFile)),
 		AllowUnauthenticated:    getEnvBool("ALLOW_UNAUTHENTICATED", false),
 		AllowCustomModelNames:   getEnvBool("ALLOW_CUSTOM_MODEL_NAMES", false),
+		GeminiStrictAltSSE:      getEnvBool("GEMINI_STRICT_ALT_SSE", false),
 		RejectChatLivenessProbe: getEnvBool("REJECT_CHAT_LIVENESS_PROBES", false),
+		ReplyChatLivenessProbe:  getEnvBool("RESPOND_CHAT_LIVENESS_PROBES", false),
 		StatsKey:                getEnv("STATS_KEY", ""),
 		Host:                    getEnv("HOST", "0.0.0.0"),
 		Port:                    getEnv("PORT", "8080"),

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,79 @@ func TestChatCompletionsRejectsWastefulLivenessProbeBeforeUpstreamCall(t *testin
 		!strings.Contains(rec.Body.String(), `"code":"health_check_not_supported"`) ||
 		!strings.Contains(rec.Body.String(), "GET /health") {
 		t.Fatalf("unexpected liveness-probe error: %s", rec.Body.String())
+	}
+}
+
+func TestChatCompletionsConstructsNormalLivenessProbeResponseBeforeUpstreamCall(t *testing.T) {
+	// Enable both actions to verify that constructing a normal response takes precedence.
+	handler := ChatCompletions(nil, true, true, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"gemini-3-flash-preview",
+		"messages":[{"role":"user","content":"hi"}],
+		"stream":false
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var response model.ChatCompletionResponse
+	if err := sonic.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if response.Object != "chat.completion" || response.Model != "gemini-3-flash-preview" {
+		t.Fatalf("unexpected completion envelope: %#v", response)
+	}
+	if len(response.Choices) != 1 || response.Choices[0].Message == nil ||
+		response.Choices[0].Message.Role != "assistant" || response.Choices[0].Message.Content != chatLivenessProbeResponse {
+		t.Fatalf("unexpected constructed choice: %#v", response.Choices)
+	}
+	if response.Choices[0].FinishReason == nil || *response.Choices[0].FinishReason != "stop" {
+		t.Fatalf("finish_reason = %v, want stop", response.Choices[0].FinishReason)
+	}
+	if response.Usage == nil || response.Usage.TotalTokens <= 0 {
+		t.Fatalf("usage = %#v, want positive estimated usage", response.Usage)
+	}
+	if strings.Contains(rec.Body.String(), `"error"`) {
+		t.Fatalf("constructed response contains an error: %s", rec.Body.String())
+	}
+}
+
+func TestChatCompletionsConstructsStreamingLivenessProbeResponse(t *testing.T) {
+	handler := ChatCompletions(nil, true, false, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"gemini-3-flash-preview",
+		"messages":[{"role":"user","content":"HI"}],
+		"stream":true,
+		"stream_options":{"include_usage":true}
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if !strings.Contains(rec.Body.String(), "data: [DONE]\n\n") {
+		t.Fatalf("stream is missing terminator: %s", rec.Body.String())
+	}
+	objects := decodeStreamDataObjects(t, rec.Body.String())
+	if len(objects) != 3 {
+		t.Fatalf("stream objects = %d, want content, finish, and usage chunks: %s", len(objects), rec.Body.String())
+	}
+	delta := deltaFromChunk(t, objects[0])
+	if delta["role"] != "assistant" || delta["content"] != chatLivenessProbeResponse {
+		t.Fatalf("unexpected constructed stream delta: %#v", delta)
+	}
+	if usage, ok := objects[2]["usage"].(map[string]interface{}); !ok || usage["total_tokens"].(float64) <= 0 {
+		t.Fatalf("unexpected stream usage chunk: %#v", objects[2])
 	}
 }
 
@@ -301,6 +375,9 @@ func TestConvertMessagesConvertsToolCallsAndResponses(t *testing.T) {
 	if got := functionCall["name"]; got != "lookup" {
 		t.Fatalf("functionCall name = %v, want lookup", got)
 	}
+	if got := functionCall["id"]; got != "call_1" {
+		t.Fatalf("functionCall id = %v, want call_1", got)
+	}
 	args := functionCall["args"].(map[string]interface{})
 	if got := args["query"]; got != "weather" {
 		t.Fatalf("functionCall query = %v, want weather", got)
@@ -313,6 +390,9 @@ func TestConvertMessagesConvertsToolCallsAndResponses(t *testing.T) {
 	functionResponse := userPart["functionResponse"].(map[string]interface{})
 	if got := functionResponse["name"]; got != "lookup" {
 		t.Fatalf("functionResponse name = %v, want lookup", got)
+	}
+	if got := functionResponse["id"]; got != "call_1" {
+		t.Fatalf("functionResponse id = %v, want call_1", got)
 	}
 	response := functionResponse["response"].(map[string]interface{})
 	if got := response["temperature"]; got != float64(72) {
@@ -348,6 +428,29 @@ func TestBuildOpenAIMessageIncludesToolCalls(t *testing.T) {
 	}
 	if got := openAIFinishReason(&proxy.CallResult{FunctionCalls: []model.FunctionCall{{Name: "lookup"}}}); got != "tool_calls" {
 		t.Fatalf("finish reason = %v, want tool_calls", got)
+	}
+}
+
+func TestConvertMessagesRestoresVertexToolCallIDFromOpaqueOpenAIID(t *testing.T) {
+	opaqueID := "call_7" + openAIToolSignatureMarker + base64.RawURLEncoding.EncodeToString([]byte("sig"))
+	contents, _ := convertMessages("gemini-3.1-pro-preview", []model.ChatMessage{
+		{
+			Role: "assistant",
+			ToolCalls: []model.ChatToolCall{{
+				ID: opaqueID,
+				Function: &model.ChatFunctionCall{
+					Name:      "lookup",
+					Arguments: `{}`,
+				},
+			}},
+		},
+		{Role: "tool", ToolCallID: opaqueID, Content: "ok"},
+	})
+
+	call := contents[0]["parts"].([]map[string]interface{})[0]["functionCall"].(map[string]interface{})
+	response := contents[1]["parts"].([]map[string]interface{})[0]["functionResponse"].(map[string]interface{})
+	if call["id"] != "call_7" || response["id"] != "call_7" {
+		t.Fatalf("Vertex IDs were not restored: call=%#v response=%#v", call, response)
 	}
 }
 
@@ -438,6 +541,44 @@ func TestStreamResponseIgnoresUnspecifiedPromptFeedback(t *testing.T) {
 	}
 	if got, want := choice["finish_reason"], "stop"; got != want {
 		t.Fatalf("final finish_reason = %v, want %q; body=%s", got, want, rec.Body.String())
+	}
+}
+
+func TestStreamResponseInvalidatesStaleOutputUsage(t *testing.T) {
+	reqModel := model.ChatCompletionRequest{
+		Model:         "gemini-test",
+		Messages:      []model.ChatMessage{{Role: "user", Content: "hello"}},
+		Stream:        true,
+		StreamOptions: &model.ChatStreamOptions{IncludeUsage: true},
+	}
+	httpReq := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+
+	streamResponseForRequest(rec, httpReq, reqModel, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+		if err := onChunk(&proxy.CallResult{
+			TextParts: []model.TextPart{{Text: "a"}},
+			UsageMetadata: map[string]interface{}{
+				"promptTokenCount": float64(7), "candidatesTokenCount": float64(1), "totalTokenCount": float64(8),
+			},
+		}); err != nil {
+			return err
+		}
+		return onChunk(&proxy.CallResult{TextParts: []model.TextPart{{Text: strings.Repeat("later output ", 20)}}, FinishReason: "STOP"})
+	})
+
+	objects := decodeStreamDataObjects(t, rec.Body.String())
+	usageObject := objects[len(objects)-1]["usage"].(map[string]interface{})
+	if got := int(usageObject["prompt_tokens"].(float64)); got != 7 {
+		t.Fatalf("prompt_tokens = %d, want invariant upstream value 7", got)
+	}
+	if got := int(usageObject["completion_tokens"].(float64)); got <= 1 {
+		t.Fatalf("completion_tokens = %d, stale upstream value was retained", got)
+	}
+	if got := rec.Header().Get("X-Usage-Estimated"); got != "true" {
+		t.Fatalf("X-Usage-Estimated = %q, want true", got)
+	}
+	if got := rec.Result().Trailer.Get("X-Usage-Estimated"); got != "true" {
+		t.Fatalf("X-Usage-Estimated trailer = %q, want true", got)
 	}
 }
 
@@ -578,6 +719,33 @@ func decodeStreamDataObjects(t *testing.T, body string) []map[string]interface{}
 		var object map[string]interface{}
 		if err := sonic.Unmarshal([]byte(payload), &object); err != nil {
 			t.Fatalf("unmarshal stream payload %q: %v", payload, err)
+		}
+		objects = append(objects, object)
+	}
+	return objects
+}
+
+func decodeSSEEventObjects(t *testing.T, body, eventType string) []map[string]interface{} {
+	t.Helper()
+	var objects []map[string]interface{}
+	for _, block := range strings.Split(body, "\n\n") {
+		lines := strings.Split(strings.TrimSpace(block), "\n")
+		matched := eventType == ""
+		payload := ""
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "event: "+eventType {
+				matched = true
+			}
+			if strings.HasPrefix(strings.TrimSpace(line), "data: ") {
+				payload = strings.TrimPrefix(strings.TrimSpace(line), "data: ")
+			}
+		}
+		if !matched || payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var object map[string]interface{}
+		if err := sonic.Unmarshal([]byte(payload), &object); err != nil {
+			t.Fatalf("unmarshal %s payload %q: %v", eventType, payload, err)
 		}
 		objects = append(objects, object)
 	}

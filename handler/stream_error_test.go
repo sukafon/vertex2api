@@ -61,7 +61,7 @@ func TestUpstreamResponseRedactionCoversAllStreamingProtocols(t *testing.T) {
 			run: func(rec *httptest.ResponseRecorder) {
 				req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 				api := &ResponsesAPI{vp: vp}
-				api.streamResponse(rec, req, model.ResponseRequest{Model: "gemini-test", Stream: true}, model.ChatCompletionRequest{Model: "gemini-test", Stream: true}, nil, nil, stream)
+				api.streamResponse(rec, req, model.ResponseRequest{Model: "gemini-test", Stream: true}, model.ChatCompletionRequest{Model: "gemini-test", Stream: true}, nil, nil, nil, stream)
 			},
 		},
 	}

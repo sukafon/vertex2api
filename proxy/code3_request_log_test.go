@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,6 +52,47 @@ func TestCode3RequestLogDeduplicatesByErrorAcrossBodiesAndRestarts(t *testing.T)
 	}
 	if got := requestField(t, entries[1]); got != "second error" {
 		t.Fatalf("second stored request = %q, want second error", got)
+	}
+}
+
+func TestCode3RequestLogRedactsRecaptchaTokenBeforeWriting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), code3RequestLogFilename)
+	requestLog := newCode3RequestLog(path)
+	body := []byte(`{"variables":{"recaptchaToken":"secret-token","nested":[{"RecaptchaToken":"nested-secret"}]},"request":"kept"}`)
+
+	captured, err := requestLog.capture(&vertexAPIError{Code: 3, Message: "redact me"}, body)
+	if err != nil || !captured {
+		t.Fatalf("capture = (%v, %v), want (true, nil)", captured, err)
+	}
+	if !bytes.Contains(body, []byte("secret-token")) {
+		t.Fatal("capture mutated the upstream request body")
+	}
+
+	entries := readCode3RequestLogEntries(t, path)
+	var stored map[string]interface{}
+	if err := json.Unmarshal(entries[0].RequestBody, &stored); err != nil {
+		t.Fatalf("decode stored request: %v", err)
+	}
+	variables := stored["variables"].(map[string]interface{})
+	if variables["recaptchaToken"] != redactedCode3RequestValue {
+		t.Fatalf("recaptchaToken = %v, want redacted", variables["recaptchaToken"])
+	}
+	nested := variables["nested"].([]interface{})[0].(map[string]interface{})
+	if nested["RecaptchaToken"] != redactedCode3RequestValue {
+		t.Fatalf("nested RecaptchaToken = %v, want redacted", nested["RecaptchaToken"])
+	}
+	if stored["request"] != "kept" {
+		t.Fatalf("non-secret field changed: %#v", stored)
+	}
+}
+
+func TestRedactCode3RequestBodyOmitsUnparseableInput(t *testing.T) {
+	body, err := redactCode3RequestBody([]byte(`{"recaptchaToken":"secret"`))
+	if err != nil {
+		t.Fatalf("redactCode3RequestBody: %v", err)
+	}
+	if bytes.Contains(body, []byte("secret")) || string(body) != `"[UNPARSEABLE REQUEST BODY OMITTED]"` {
+		t.Fatalf("unparseable body was not safely omitted: %s", body)
 	}
 }
 
@@ -183,8 +225,18 @@ func TestDoStreamCapturesCode3RequestWhenEnabled(t *testing.T) {
 	if entries[0].Error != "captured through doStream" {
 		t.Fatalf("stored error = %q", entries[0].Error)
 	}
-	if string(entries[0].RequestBody) != string(body) {
-		t.Fatalf("stored request body differs from upstream request\n got: %s\nwant: %s", entries[0].RequestBody, body)
+	var stored map[string]interface{}
+	if err := json.Unmarshal(entries[0].RequestBody, &stored); err != nil {
+		t.Fatalf("decode stored request: %v", err)
+	}
+	variables := stored["variables"].(map[string]interface{})
+	if variables["recaptchaToken"] != redactedCode3RequestValue {
+		t.Fatalf("stored recaptchaToken = %v, want redacted", variables["recaptchaToken"])
+	}
+	contents := variables["contents"].([]interface{})
+	parts := contents[0].(map[string]interface{})["parts"].([]interface{})
+	if parts[0].(map[string]interface{})["text"] != "body to capture" {
+		t.Fatalf("stored diagnostic body lost content: %#v", stored)
 	}
 }
 

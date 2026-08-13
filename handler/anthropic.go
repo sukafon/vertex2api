@@ -225,17 +225,6 @@ func sendAnthropicResponse(w http.ResponseWriter, req model.AnthropicMessageRequ
 	WriteJSON(w, http.StatusOK, resp)
 }
 
-func estimateAnthropicOutputTokens(result *proxy.CallResult) int {
-	if result == nil || (len(result.TextParts) == 0 && len(result.ImageParts) == 0 && len(result.FunctionCalls) == 0) {
-		return 0
-	}
-	return estimateTokenValue(map[string]interface{}{
-		"content":    result.TextParts,
-		"images":     result.ImageParts,
-		"tool_calls": result.FunctionCalls,
-	}, "")
-}
-
 func streamAnthropicResponse(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -256,6 +245,7 @@ func streamAnthropicResponseWithProxy(
 	ctx := r.Context()
 	streamState := &anthropicStreamState{w: w, openTextIndex: -1, openThinkingIndex: -1}
 	aggregate := &proxy.CallResult{}
+	usageRevision := &streamUsageRevision{}
 	committed := false
 	err := stream(ctx, func(result *proxy.CallResult) error {
 		if err := ctx.Err(); err != nil {
@@ -264,10 +254,16 @@ func streamAnthropicResponseWithProxy(
 		if result == nil || result.IsEmpty() {
 			return nil
 		}
+		usageRevision.observe(result)
 		accumulateCallResult(aggregate, result)
 		if !committed {
+			declareUsageEstimateTrailer(w)
+			snapshot := usageSnapshot(aggregate, usageRevision)
+			initialUsage, estimated := anthropicUsage(req, &snapshot)
+			if estimated {
+				w.Header().Set("X-Usage-Estimated", "true")
+			}
 			setSSEHeaders(w)
-			initialUsage, _ := anthropicUsage(req, result)
 			if err := writeAnthropicMessageStart(w, id, req.Model, initialUsage); err != nil {
 				return err
 			}
@@ -300,8 +296,13 @@ func streamAnthropicResponseWithProxy(
 		return
 	}
 	if !committed {
+		declareUsageEstimateTrailer(w)
+		snapshot := usageSnapshot(aggregate, usageRevision)
+		initialUsage, estimated := anthropicUsage(req, &snapshot)
+		if estimated {
+			w.Header().Set("X-Usage-Estimated", "true")
+		}
 		setSSEHeaders(w)
-		initialUsage, _ := anthropicUsage(req, aggregate)
 		if err := writeAnthropicMessageStart(w, id, req.Model, initialUsage); err != nil {
 			return
 		}
@@ -313,7 +314,9 @@ func streamAnthropicResponseWithProxy(
 	// The Anthropic message terminator is emitted only after Vertex reaches EOF;
 	// an earlier finishReason does not terminate the upstream stream.
 	stopReason := anthropicStopReason(aggregate)
-	finalUsage, _ := anthropicUsage(req, aggregate)
+	snapshot := usageSnapshot(&streamState.usageResult, usageRevision)
+	finalUsage, estimated := anthropicUsage(req, &snapshot)
+	finishUsageEstimate(w, estimated)
 	if err := writeAnthropicMessageDeltaWithUsage(w, stopReason, finalUsage); err != nil {
 		log.Error().Err(err).Str("model", req.Model).Msg("Anthropic stream message_delta failed")
 		return
@@ -331,7 +334,7 @@ type anthropicStreamState struct {
 	seenText          string
 	seenThinking      string
 	emittedSignature  bool
-	outputTokens      int
+	usageResult       proxy.CallResult
 }
 
 func (s *anthropicStreamState) writeBlock(block map[string]interface{}) error {
@@ -343,9 +346,9 @@ func (s *anthropicStreamState) writeBlock(block map[string]interface{}) error {
 		}
 		index := s.nextIndex
 		s.nextIndex++
-		inputJSON, _ := sonic.Marshal(block["input"])
 		name, _ := block["name"].(string)
-		s.outputTokens += (len(inputJSON)+len(name))/4 + 1
+		input, _ := block["input"].(map[string]interface{})
+		s.usageResult.FunctionCalls = append(s.usageResult.FunctionCalls, model.FunctionCall{Name: name, Args: input})
 		return writeAnthropicToolUseBlock(s.w, index, block)
 	case "thinking":
 		thinking, _ := block["thinking"].(string)
@@ -386,7 +389,7 @@ func (s *anthropicStreamState) writeThinkingDelta(thinking, signature string) er
 	}
 
 	if delta != "" {
-		s.outputTokens += len(delta)/4 + 1
+		s.usageResult.TextParts = append(s.usageResult.TextParts, model.TextPart{Text: delta, Thought: true})
 		if err := writeAnthropicSSE(s.w, "content_block_delta", map[string]interface{}{
 			"type":  "content_block_delta",
 			"index": s.openThinkingIndex,
@@ -398,7 +401,6 @@ func (s *anthropicStreamState) writeThinkingDelta(thinking, signature string) er
 
 	if signature != "" && !s.emittedSignature {
 		s.emittedSignature = true
-		s.outputTokens += len(signature)/4 + 1
 		if err := writeAnthropicSSE(s.w, "content_block_delta", map[string]interface{}{
 			"type":  "content_block_delta",
 			"index": s.openThinkingIndex,
@@ -423,7 +425,6 @@ func (s *anthropicStreamState) writeTextDelta(text string) error {
 		}
 	}
 
-	s.outputTokens += len(delta)/4 + 1
 	if s.openTextIndex < 0 {
 		index := s.nextIndex
 		s.nextIndex++
@@ -436,6 +437,7 @@ func (s *anthropicStreamState) writeTextDelta(text string) error {
 			return err
 		}
 	}
+	s.usageResult.TextParts = append(s.usageResult.TextParts, model.TextPart{Text: delta})
 	return writeAnthropicSSE(s.w, "content_block_delta", map[string]interface{}{
 		"type":  "content_block_delta",
 		"index": s.openTextIndex,
@@ -1115,6 +1117,13 @@ func convertAnthropicThinking(thinking map[string]interface{}) map[string]interf
 func buildAnthropicRequestOptions(req model.AnthropicMessageRequest) *proxy.VertexRequestOptions {
 	tools := convertAnthropicTools(req.Tools)
 	toolConfig := convertAnthropicToolChoice(req.ToolChoice)
+	if nativeTool, ok := selectedAnthropicNativeTool(req.ToolChoice, req.Tools); ok {
+		// Vertex's allowedFunctionNames applies only to functionDeclarations. A
+		// hosted Anthropic tool such as web_search is represented by googleSearch,
+		// so force it by sending only that native tool and omitting function config.
+		tools = []interface{}{nativeTool}
+		toolConfig = nil
+	}
 	if tools == nil && toolConfig == nil {
 		return nil
 	}
@@ -1122,6 +1131,34 @@ func buildAnthropicRequestOptions(req model.AnthropicMessageRequest) *proxy.Vert
 		Tools:      tools,
 		ToolConfig: toolConfig,
 	}
+}
+
+func selectedAnthropicNativeTool(choice interface{}, tools []map[string]interface{}) (map[string]interface{}, bool) {
+	choiceMap, ok := choice.(map[string]interface{})
+	choiceType, _ := choiceMap["type"].(string)
+	if !ok || !strings.EqualFold(strings.TrimSpace(choiceType), "tool") {
+		return nil, false
+	}
+	choiceName, _ := choiceMap["name"].(string)
+	choiceName = strings.TrimSpace(choiceName)
+	choiceField, ok := nativeGeminiToolFieldName(choiceName)
+	if !ok {
+		return nil, false
+	}
+
+	for _, tool := range tools {
+		nativeTool, native := convertNativeGeminiTool(tool)
+		if !native {
+			continue
+		}
+		toolField, _, fieldOK := nativeGeminiToolFieldValue(nativeTool)
+		toolName, _ := tool["name"].(string)
+		toolName = strings.TrimSpace(toolName)
+		if fieldOK && toolField == choiceField && (toolName == "" || strings.EqualFold(toolName, choiceName)) {
+			return nativeTool, true
+		}
+	}
+	return nil, false
 }
 
 func convertAnthropicTools(tools []map[string]interface{}) interface{} {
@@ -1601,11 +1638,17 @@ type jsonNumber interface {
 }
 
 func estimateAnthropicInputTokens(req model.AnthropicMessageRequest) int {
-	return estimateJSONTokens(map[string]interface{}{
-		"system":   req.System,
-		"messages": req.Messages,
-		"tools":    req.Tools,
-	})
+	payload := map[string]interface{}{"messages": req.Messages}
+	if req.System != nil {
+		payload["system"] = req.System
+	}
+	if len(req.Tools) > 0 {
+		payload["tools"] = req.Tools
+	}
+	if len(req.OutputConfig) > 0 {
+		payload["output_config"] = req.OutputConfig
+	}
+	return estimateJSONTokens(payload)
 }
 
 func anthropicMessageID() string {

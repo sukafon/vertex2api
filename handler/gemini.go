@@ -2,11 +2,14 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"vertex2api/model"
 	"vertex2api/proxy"
@@ -18,7 +21,7 @@ import (
 // GeminiGenerate 处理 Gemini 原生端点
 // POST /v1beta1/models/{model}:generateContent
 // POST /v1beta1/models/{model}:streamGenerateContent
-func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Handler {
+func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames, strictAltSSE bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerGeminiNative))
 		// 解析路径: modelAction = "gemini-2.0-flash:generateContent"
@@ -98,8 +101,9 @@ func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Hand
 		if genConfig == nil {
 			genConfig = map[string]interface{}{}
 		}
+		includeThoughts := geminiIncludeThoughts(genConfig)
 
-		if isStream {
+		if isStream && geminiRequestUsesSSE(r, strictAltSSE) {
 			bodyJSON, tokenLease, err := vp.BuildBodyWithTokenWithOptionsContext(r.Context(), modelName, contents, genConfig, safetySettings, systemInstruction, options)
 			if err != nil {
 				if requestContextCanceled(r.Context(), err) {
@@ -110,9 +114,10 @@ func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Hand
 				WriteJSON(w, http.StatusInternalServerError, geminiErrorResponse(err))
 				return
 			}
-			streamGeminiResponseWithProxy(w, r, modelName, vp, func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
+			stream := func(ctx context.Context, onChunk func(*proxy.CallResult) error) error {
 				return vp.StreamWithTokenContext(ctx, bodyJSON, tokenLease, onChunk)
-			})
+			}
+			streamGeminiResponseWithProxyOptions(w, r, modelName, vp, includeThoughts, geminiReq, stream)
 			return
 		}
 
@@ -126,16 +131,23 @@ func GeminiGenerate(vp *proxy.VertexProxy, allowCustomModelNames bool) http.Hand
 			return
 		}
 
-		// 构建 Gemini 原生格式响应
-		geminiResp := buildGeminiResponse(result)
-		usage, estimated := geminiUsageMetadata(geminiReq, result)
-		geminiResp["usageMetadata"] = usage
-		if estimated {
-			w.Header().Set("X-Usage-Estimated", "true")
-		}
-
-		WriteJSON(w, http.StatusOK, geminiResp)
+		writeGeminiCompletedResponse(w, geminiReq, result, includeThoughts)
 	})
+}
+
+func writeGeminiCompletedResponse(
+	w http.ResponseWriter,
+	requestInput interface{},
+	result *proxy.CallResult,
+	includeThoughts bool,
+) {
+	response := buildGeminiResponseForRequest(result, includeThoughts)
+	usage, estimated := geminiUsageMetadata(requestInput, result)
+	response["usageMetadata"] = usage
+	if estimated {
+		w.Header().Set("X-Usage-Estimated", "true")
+	}
+	WriteJSON(w, http.StatusOK, response)
 }
 
 func buildGeminiResponse(result *proxy.CallResult) map[string]interface{} {
@@ -144,6 +156,23 @@ func buildGeminiResponse(result *proxy.CallResult) map[string]interface{} {
 
 func buildGeminiStreamResponse(result *proxy.CallResult) map[string]interface{} {
 	return buildGeminiResponseWithFinish(result, false)
+}
+
+func buildGeminiResponseForRequest(result *proxy.CallResult, includeThoughts bool) map[string]interface{} {
+	return buildGeminiResponseWithOptions(result, true, includeThoughts)
+}
+
+func buildGeminiStreamResponseForRequest(result *proxy.CallResult, includeThoughts bool) map[string]interface{} {
+	return buildGeminiResponseWithOptions(result, false, includeThoughts)
+}
+
+func geminiIncludeThoughts(genConfig map[string]interface{}) bool {
+	thinkingConfig, ok := genConfig["thinkingConfig"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	includeThoughts, _ := thinkingConfig["includeThoughts"].(bool)
+	return includeThoughts
 }
 
 func buildGeminiRequestOptions(req map[string]interface{}) *proxy.VertexRequestOptions {
@@ -169,6 +198,10 @@ func buildGeminiRequestOptions(req map[string]interface{}) *proxy.VertexRequestO
 }
 
 func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) map[string]interface{} {
+	return buildGeminiResponseWithOptions(result, defaultStop, true)
+}
+
+func buildGeminiResponseWithOptions(result *proxy.CallResult, defaultStop, includeThoughts bool) map[string]interface{} {
 	response := make(map[string]interface{})
 	if result == nil {
 		return response
@@ -179,7 +212,7 @@ func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) m
 	if !promptWasBlocked && len(result.Candidates) > 0 {
 		for _, candidate := range result.Candidates {
 			candidateResult := callResultFromCandidate(candidate)
-			candidateMap := buildGeminiCandidate(candidateResult, defaultStop)
+			candidateMap := buildGeminiCandidateWithThoughts(candidateResult, defaultStop, includeThoughts)
 			if candidate.FinishMessage != "" {
 				candidateMap["finishMessage"] = candidate.FinishMessage
 			}
@@ -208,7 +241,7 @@ func buildGeminiResponseWithFinish(result *proxy.CallResult, defaultStop bool) m
 			candidates = append(candidates, candidateMap)
 		}
 	} else if !promptWasBlocked && (result.HasContent() || result.FinishReason != "") {
-		candidateMap := buildGeminiCandidate(result, defaultStop)
+		candidateMap := buildGeminiCandidateWithThoughts(result, defaultStop, includeThoughts)
 		if len(candidateMap) > 0 {
 			candidates = append(candidates, candidateMap)
 		}
@@ -365,7 +398,11 @@ func isKnownGeminiHarmProbability(probability string) bool {
 }
 
 func buildGeminiCandidate(result *proxy.CallResult, defaultStop bool) map[string]interface{} {
-	parts := buildCanonicalGeminiParts(result)
+	return buildGeminiCandidateWithThoughts(result, defaultStop, true)
+}
+
+func buildGeminiCandidateWithThoughts(result *proxy.CallResult, defaultStop, includeThoughts bool) map[string]interface{} {
+	parts := buildCanonicalGeminiPartsWithThoughts(result, includeThoughts)
 	if defaultStop {
 		parts = coalesceCanonicalGeminiTextParts(parts)
 	}
@@ -394,6 +431,10 @@ func buildGeminiCandidate(result *proxy.CallResult, defaultStop bool) map[string
 }
 
 func buildCanonicalGeminiParts(result *proxy.CallResult) []map[string]interface{} {
+	return buildCanonicalGeminiPartsWithThoughts(result, true)
+}
+
+func buildCanonicalGeminiPartsWithThoughts(result *proxy.CallResult, includeThoughts bool) []map[string]interface{} {
 	if result == nil {
 		return nil
 	}
@@ -401,7 +442,9 @@ func buildCanonicalGeminiParts(result *proxy.CallResult) []map[string]interface{
 	if result.Parts != nil {
 		for _, sourcePart := range result.Parts {
 			if part, ok := canonicalGeminiPart(sourcePart); ok {
-				parts = append(parts, part)
+				if part, ok = filterUnrequestedGeminiThought(part, includeThoughts); ok {
+					parts = append(parts, part)
+				}
 			}
 		}
 		return parts
@@ -415,7 +458,9 @@ func buildCanonicalGeminiParts(result *proxy.CallResult) []map[string]interface{
 			Thought:          textPart.Thought,
 			ThoughtSignature: textPart.ThoughtSignature,
 		}); ok {
-			parts = append(parts, part)
+			if part, ok = filterUnrequestedGeminiThought(part, includeThoughts); ok {
+				parts = append(parts, part)
+			}
 		}
 	}
 	for i := range result.ImageParts {
@@ -433,6 +478,46 @@ func buildCanonicalGeminiParts(result *proxy.CallResult) []map[string]interface{
 		}
 	}
 	return parts
+}
+
+func filterUnrequestedGeminiThought(part map[string]interface{}, includeThoughts bool) (map[string]interface{}, bool) {
+	thought, _ := part["thought"].(bool)
+	if includeThoughts || !thought {
+		return part, true
+	}
+
+	// Thought summaries are opt-in in the Gemini API. The anonymous Vertex
+	// backend can still return them when includeThoughts was not requested, so
+	// remove only the summary text at the compatibility boundary. Preserve an
+	// opaque thoughtSignature as an empty text part because Gemini 3 clients
+	// must be able to round-trip that signature in later requests.
+	filtered := make(map[string]interface{}, len(part))
+	for key, value := range part {
+		if key == "text" || key == "thought" {
+			continue
+		}
+		filtered[key] = value
+	}
+	if signature, _ := filtered["thoughtSignature"].(string); strings.TrimSpace(signature) != "" {
+		filtered["text"] = ""
+		return filtered, true
+	}
+	if canonicalGeminiPartHasData(filtered) {
+		return filtered, true
+	}
+	return nil, false
+}
+
+func canonicalGeminiPartHasData(part map[string]interface{}) bool {
+	for _, key := range []string{
+		"text", "inlineData", "fileData", "functionCall", "functionResponse",
+		"executableCode", "codeExecutionResult",
+	} {
+		if _, ok := part[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalGeminiPart(source model.VertexPart) (map[string]interface{}, bool) {
@@ -715,27 +800,401 @@ func streamGeminiResponseWithProxy(
 	vp *proxy.VertexProxy,
 	stream func(context.Context, func(*proxy.CallResult) error) error,
 ) {
+	streamGeminiResponseWithProxyOptions(w, r, modelName, vp, true, nil, stream)
+}
+
+func geminiRequestUsesSSE(r *http.Request, strictAltSSE bool) bool {
+	if !strictAltSSE {
+		return true
+	}
+	values, ok := r.URL.Query()["alt"]
+	return ok && len(values) == 1 && values[0] == "sse"
+}
+
+type geminiStreamResponseState struct {
+	includeThoughts     bool
+	requestInput        interface{}
+	aggregate           proxy.CallResult
+	usageRevision       streamUsageRevision
+	promptTokenEstimate int
+	modelVersion        string
+	responseID          string
+	fallbackModel       string
+	identityCommitted   bool
+}
+
+func (s *geminiStreamResponseState) buildChunk(result *proxy.CallResult) (map[string]interface{}, bool) {
+	if result == nil {
+		return nil, false
+	}
+	if s.requestInput != nil {
+		if !s.identityCommitted {
+			if s.modelVersion == "" && result.ModelVersion != "" {
+				s.modelVersion = result.ModelVersion
+			}
+			if s.responseID == "" && result.ResponseID != "" {
+				s.responseID = result.ResponseID
+			}
+		}
+		s.usageRevision.observe(result)
+		accumulateGeminiCallResult(&s.aggregate, result)
+	}
+	chunk := buildGeminiStreamResponseForRequest(result, s.includeThoughts)
+	if len(chunk) == 0 {
+		return nil, false
+	}
+	if s.requestInput == nil {
+		return chunk, result.HasFinishReason()
+	}
+
+	// Keep usage at the response envelope level, but repeat the latest
+	// cumulative value on every observable stream message for compatibility
+	// with gateways that account for Gemini usage per chunk.
+	delete(chunk, "usageMetadata")
+	if !geminiStreamChunkHasMessage(chunk) {
+		return nil, result.HasFinishReason()
+	}
+	return chunk, result.HasFinishReason()
+}
+
+func newGeminiStreamResponseID() string {
+	data := make([]byte, 20)
+	if _, err := rand.Read(data); err != nil {
+		return fmt.Sprintf("response-%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func accumulateGeminiCallResult(dst, src *proxy.CallResult) {
+	accumulateCallResult(dst, src)
+	if dst == nil || src == nil {
+		return
+	}
+	for _, incoming := range src.Candidates {
+		matched := false
+		for i := range dst.Candidates {
+			candidate := &dst.Candidates[i]
+			if candidate.Index != incoming.Index {
+				continue
+			}
+			candidate.Parts = append(candidate.Parts, incoming.Parts...)
+			candidate.TextParts = append(candidate.TextParts, incoming.TextParts...)
+			candidate.ImageParts = append(candidate.ImageParts, incoming.ImageParts...)
+			candidate.FunctionCalls = append(candidate.FunctionCalls, incoming.FunctionCalls...)
+			matched = true
+			break
+		}
+		if !matched {
+			dst.Candidates = append(dst.Candidates, incoming)
+		}
+	}
+}
+
+type geminiStreamUsageSnapshot struct {
+	metadata  map[string]interface{}
+	estimated bool
+}
+
+func (s *geminiStreamResponseState) captureUsage() geminiStreamUsageSnapshot {
+	if s == nil || s.requestInput == nil {
+		return geminiStreamUsageSnapshot{}
+	}
+	if s.promptTokenEstimate == 0 {
+		s.promptTokenEstimate = estimateJSONTokens(s.requestInput)
+	}
+	// Consume the shallow aggregate view synchronously and retain only computed
+	// scalar metadata. No mutable CallResult data escapes this method.
+	result := usageSnapshot(&s.aggregate, &s.usageRevision)
+	metadata, estimated := geminiUsageMetadataWithPromptEstimate(s.promptTokenEstimate, &result)
+	return geminiStreamUsageSnapshot{metadata: metadata, estimated: estimated}
+}
+
+type pendingGeminiStreamChunk struct {
+	payload     map[string]interface{}
+	usage       geminiStreamUsageSnapshot
+	substantive bool
+}
+
+func (p *pendingGeminiStreamChunk) empty() bool {
+	return p == nil || len(p.payload) == 0
+}
+
+func (p *pendingGeminiStreamChunk) set(payload map[string]interface{}, usage geminiStreamUsageSnapshot, substantive bool) {
+	p.payload = payload
+	p.usage = usage
+	p.substantive = substantive
+}
+
+func (p *pendingGeminiStreamChunk) merge(payload map[string]interface{}, usage geminiStreamUsageSnapshot, substantive bool) {
+	mergeGeminiStreamTail(p.payload, payload)
+	p.usage = usage
+	p.substantive = p.substantive || substantive
+}
+
+func (p *pendingGeminiStreamChunk) clear() {
+	p.payload = nil
+	p.usage = geminiStreamUsageSnapshot{}
+	p.substantive = false
+}
+
+func (s *geminiStreamResponseState) prepareChunkForEmission(chunk map[string]interface{}, usage geminiStreamUsageSnapshot) bool {
+	if chunk == nil || s.requestInput == nil {
+		return false
+	}
+	if !s.identityCommitted {
+		if s.modelVersion == "" {
+			s.modelVersion = s.fallbackModel
+		}
+		if s.responseID == "" {
+			s.responseID = newGeminiStreamResponseID()
+		}
+		s.identityCommitted = true
+	}
+	if s.responseID != "" {
+		chunk["responseId"] = s.responseID
+	}
+	if s.modelVersion != "" {
+		chunk["modelVersion"] = s.modelVersion
+	}
+	chunk["usageMetadata"] = usage.metadata
+	return usage.estimated
+}
+
+func geminiStreamChunkHasMessage(chunk map[string]interface{}) bool {
+	if chunk == nil {
+		return false
+	}
+	for _, key := range []string{"candidates", "promptFeedback", "modelStatus"} {
+		if _, ok := chunk[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func geminiStreamChunkHasSubstantiveCandidateContent(chunk map[string]interface{}) bool {
+	candidates, _ := chunk["candidates"].([]map[string]interface{})
+	for _, candidate := range candidates {
+		content, _ := candidate["content"].(map[string]interface{})
+		parts, _ := content["parts"].([]map[string]interface{})
+		for _, part := range parts {
+			if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
+				return true
+			}
+			for key, value := range part {
+				if key != "text" && key != "thought" && key != "thoughtSignature" && value != nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func mergeGeminiStreamTail(dst, tail map[string]interface{}) {
+	if dst == nil || tail == nil {
+		return
+	}
+	for key, value := range tail {
+		if key != "candidates" {
+			dst[key] = value
+		}
+	}
+
+	dstCandidates, _ := dst["candidates"].([]map[string]interface{})
+	tailCandidates, _ := tail["candidates"].([]map[string]interface{})
+	for _, tailCandidate := range tailCandidates {
+		matched := false
+		for _, dstCandidate := range dstCandidates {
+			if fmt.Sprint(dstCandidate["index"]) != fmt.Sprint(tailCandidate["index"]) {
+				continue
+			}
+			for key, value := range tailCandidate {
+				if key == "content" {
+					tailContent, _ := value.(map[string]interface{})
+					if len(tailContent) == 0 {
+						continue
+					}
+					dstContent, _ := dstCandidate["content"].(map[string]interface{})
+					if dstContent == nil {
+						dstContent = make(map[string]interface{}, len(tailContent))
+						dstCandidate["content"] = dstContent
+					}
+					for contentKey, contentValue := range tailContent {
+						if contentKey == "parts" {
+							dstParts, _ := dstContent["parts"].([]map[string]interface{})
+							tailParts, _ := contentValue.([]map[string]interface{})
+							dstContent["parts"] = append(dstParts, tailParts...)
+							continue
+						}
+						dstContent[contentKey] = contentValue
+					}
+					continue
+				}
+				dstCandidate[key] = value
+			}
+			matched = true
+			break
+		}
+		if !matched {
+			dstCandidates = append(dstCandidates, tailCandidate)
+		}
+	}
+	if len(dstCandidates) > 0 {
+		dst["candidates"] = dstCandidates
+	}
+}
+
+func splitGeminiStreamFinishChunk(chunk map[string]interface{}) (map[string]interface{}, map[string]interface{}) {
+	if chunk == nil {
+		return nil, nil
+	}
+	contentChunk := make(map[string]interface{}, len(chunk))
+	for key, value := range chunk {
+		if key != "candidates" && key != "usageMetadata" && key != "modelVersion" && key != "responseId" {
+			contentChunk[key] = value
+		}
+	}
+
+	contentCandidates := make([]map[string]interface{}, 0)
+	finishCandidates := make([]map[string]interface{}, 0)
+	candidates, _ := chunk["candidates"].([]map[string]interface{})
+	for _, candidate := range candidates {
+		contentCandidate := make(map[string]interface{}, len(candidate))
+		for key, value := range candidate {
+			if key != "finishReason" && key != "finishMessage" {
+				contentCandidate[key] = value
+			}
+		}
+		if len(contentCandidate) > 1 || contentCandidate["content"] != nil {
+			contentCandidates = append(contentCandidates, contentCandidate)
+		}
+
+		if finishReason, ok := candidate["finishReason"]; ok {
+			finishCandidate := map[string]interface{}{
+				"index":        candidate["index"],
+				"finishReason": finishReason,
+			}
+			finishCandidates = append(finishCandidates, finishCandidate)
+		}
+	}
+	if len(contentCandidates) > 0 {
+		contentChunk["candidates"] = contentCandidates
+	}
+	if len(contentChunk) == 0 {
+		contentChunk = nil
+	}
+	if len(finishCandidates) == 0 {
+		return contentChunk, nil
+	}
+	return contentChunk, map[string]interface{}{"candidates": finishCandidates}
+}
+
+func streamGeminiResponseWithProxyOptions(
+	w http.ResponseWriter,
+	r *http.Request,
+	modelName string,
+	vp *proxy.VertexProxy,
+	includeThoughts bool,
+	requestInput interface{},
+	stream func(context.Context, func(*proxy.CallResult) error) error,
+) {
 	ctx := r.Context()
 	committed := false
-	err := stream(ctx, func(result *proxy.CallResult) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if result == nil {
-			return nil
-		}
-		chunk := buildGeminiStreamResponse(result)
+	state := &geminiStreamResponseState{
+		includeThoughts: includeThoughts,
+		requestInput:    requestInput,
+		fallbackModel:   modelName,
+	}
+	var pending pendingGeminiStreamChunk
+	emit := func(chunk map[string]interface{}, usage geminiStreamUsageSnapshot) error {
 		if len(chunk) == 0 {
-			// Upstream may send a candidate shell containing only default values
-			// and an unspecified promptFeedback. Normalize before deciding whether
-			// this is an observable Gemini SSE event.
 			return nil
+		}
+		estimated := false
+		if requestInput != nil {
+			estimated = state.prepareChunkForEmission(chunk, usage)
+			finishUsageEstimate(w, estimated)
 		}
 		if !committed {
+			if requestInput != nil {
+				declareUsageEstimateTrailer(w)
+			}
 			setSSEHeaders(w)
 			committed = true
 		}
 		return writeGeminiStreamChunk(w, chunk)
+	}
+	err := stream(ctx, func(result *proxy.CallResult) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk, tail := state.buildChunk(result)
+		if len(chunk) == 0 {
+			// Upstream may send a candidate shell containing only default values
+			// and an unspecified promptFeedback. Normalize before deciding whether
+			// this is an observable Gemini SSE event. It may still carry usage or a
+			// hidden thought, so refresh the pending chunk's accounting snapshot.
+			if !pending.empty() {
+				pending.usage = state.captureUsage()
+			}
+			return nil
+		}
+		usageSnapshot := state.captureUsage()
+
+		substantive := geminiStreamChunkHasSubstantiveCandidateContent(chunk)
+		if tail {
+			// The Vertex decoder normally delivers finish metadata separately.
+			// If a caller supplies content and finishReason together, split them
+			// so the Gemini compatibility surface still emits the requested final
+			// candidate-only completion block.
+			contentChunk, finishChunk := splitGeminiStreamFinishChunk(chunk)
+			if len(contentChunk) > 0 {
+				contentSubstantive := geminiStreamChunkHasSubstantiveCandidateContent(contentChunk)
+				if !pending.empty() {
+					if pending.substantive && contentSubstantive {
+						if err := emit(pending.payload, pending.usage); err != nil {
+							return err
+						}
+						pending.clear()
+					} else {
+						pending.merge(contentChunk, usageSnapshot, contentSubstantive)
+					}
+				}
+				if pending.empty() {
+					pending.set(contentChunk, usageSnapshot, contentSubstantive)
+				}
+			}
+			if !pending.empty() {
+				if pending.substantive {
+					if err := emit(pending.payload, pending.usage); err != nil {
+						return err
+					}
+				} else {
+					// When the stream contains no actual output, retain the opaque
+					// thoughtSignature by attaching its empty content part to the
+					// terminal candidate instead of emitting an empty normal block.
+					mergeGeminiStreamTail(finishChunk, pending.payload)
+				}
+				pending.clear()
+			}
+			return emit(finishChunk, usageSnapshot)
+		}
+		if !pending.empty() && pending.substantive && substantive {
+			if err := emit(pending.payload, pending.usage); err != nil {
+				return err
+			}
+			pending.clear()
+		}
+		if pending.empty() {
+			pending.set(chunk, usageSnapshot, substantive)
+		} else {
+			// A thoughtSignature-only delta is transport metadata, not an actual
+			// message. Fold it into the last visible message so the terminal
+			// finishReason never lands on an empty text shell.
+			pending.merge(chunk, usageSnapshot, substantive)
+		}
+		return nil
 	})
 	if err != nil {
 		if requestContextCanceled(ctx, err) {
@@ -745,12 +1204,28 @@ func streamGeminiResponseWithProxy(
 		if !proxy.IsUpstreamErrorLogged(err) {
 			log.Error().Str("err", upstreamLogError(vp, err)).Str("model", modelName).Msg("Gemini Native stream failed")
 		}
+		if !pending.empty() {
+			if writeErr := emit(pending.payload, pending.usage); writeErr != nil {
+				return
+			}
+			pending.clear()
+		}
 		if !committed {
 			writeUpstreamProtocolError(w, r, vp, err)
 			return
 		}
 		_ = writeGeminiStreamError(w, vp, err)
 		return
+	}
+	if !pending.empty() {
+		if err := emit(pending.payload, pending.usage); err != nil {
+			if requestContextCanceled(ctx, err) {
+				log.Debug().Err(err).Str("model", modelName).Msg("Gemini stream client disconnected")
+				return
+			}
+			log.Error().Err(err).Str("model", modelName).Msg("Gemini Native stream final chunk failed")
+			return
+		}
 	}
 	if !committed {
 		setSSEHeaders(w)

@@ -18,14 +18,22 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// ChatCompletions 处理 POST /v1/chat/completions
-func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool, rejectLivenessProbes ...bool) http.Handler {
-	rejectLivenessProbe := len(rejectLivenessProbes) > 0 && rejectLivenessProbes[0]
+const chatLivenessProbeResponse = "Hello! How can I help you today?"
+
+// ChatCompletions 处理 POST /v1/chat/completions。可选的防测活开关依次为“拒绝”和“构造正常响应”。
+func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool, livenessProbeOptions ...bool) http.Handler {
+	rejectLivenessProbe := len(livenessProbeOptions) > 0 && livenessProbeOptions[0]
+	respondLivenessProbe := len(livenessProbeOptions) > 1 && livenessProbeOptions[1]
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(proxy.WithCompatibilityLayer(r.Context(), proxy.CompatibilityLayerOpenAIChatCompletions))
 		var req model.ChatCompletionRequest
 		_, ok := readJSONRequest(w, r, &req)
 		if !ok {
+			return
+		}
+
+		if respondLivenessProbe && isWastefulLivenessProbe(req) {
+			writeChatLivenessProbeResponse(w, r, req)
 			return
 		}
 
@@ -127,6 +135,20 @@ func ChatCompletions(vp *proxy.VertexProxy, allowCustomModelNames bool, rejectLi
 
 		sendChatResponse(w, req, req.Model, result)
 	})
+}
+
+func writeChatLivenessProbeResponse(w http.ResponseWriter, r *http.Request, req model.ChatCompletionRequest) {
+	result := &proxy.CallResult{
+		TextParts:    []model.TextPart{{Text: chatLivenessProbeResponse}},
+		FinishReason: "STOP",
+	}
+	if req.Stream {
+		streamResponseForRequest(w, r, req, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+			return onChunk(result)
+		})
+		return
+	}
+	sendChatResponse(w, req, req.Model, result)
 }
 
 func isWastefulLivenessProbe(req model.ChatCompletionRequest) bool {
@@ -365,48 +387,117 @@ func callResultFromCandidate(candidate proxy.CandidateResult) *proxy.CallResult 
 }
 
 func estimateOpenAIPromptTokens(req model.ChatCompletionRequest) int {
-	return estimateJSONTokens(map[string]interface{}{
-		"messages": req.Messages,
-		"tools":    req.Tools,
-	})
+	payload := map[string]interface{}{"messages": req.Messages}
+	if len(req.Tools) > 0 {
+		payload["tools"] = req.Tools
+	}
+	if len(req.ResponseFormat) > 0 {
+		payload["response_format"] = req.ResponseFormat
+	}
+	return estimateJSONTokens(payload)
 }
 
 func estimateOpenAICompletionTokens(result *proxy.CallResult) int {
+	candidateTokens, reasoningTokens := estimateCompletionTokenBreakdown(result)
+	return saturatingTokenAdd(candidateTokens, reasoningTokens)
+}
+
+func estimateCompletionTokenBreakdown(result *proxy.CallResult) (candidateTokens, reasoningTokens int) {
 	if result != nil && len(result.Candidates) > 0 {
-		total := 0
 		for _, candidate := range result.Candidates {
-			total += estimateOpenAICompletionTokens(callResultFromCandidate(candidate))
+			candidateEstimate, reasoningEstimate := estimateCompletionTokenBreakdown(callResultFromCandidate(candidate))
+			candidateTokens = saturatingTokenAdd(candidateTokens, candidateEstimate)
+			reasoningTokens = saturatingTokenAdd(reasoningTokens, reasoningEstimate)
 		}
-		return total
+		return candidateTokens, reasoningTokens
 	}
-	if result == nil || (len(result.TextParts) == 0 && len(result.ImageParts) == 0 && len(result.FunctionCalls) == 0) {
-		return 0
+	if result == nil {
+		return 0, 0
 	}
-	return estimateTokenValue(map[string]interface{}{
-		"text":       result.TextParts,
-		"images":     result.ImageParts,
-		"tool_calls": result.FunctionCalls,
-	}, "")
+
+	if len(result.Parts) > 0 {
+		var candidateText, reasoningText strings.Builder
+		for i := range result.Parts {
+			part := result.Parts[i]
+			if part.Thought {
+				reasoningText.WriteString(part.Text)
+			} else {
+				candidateText.WriteString(part.Text)
+			}
+			part.Text = ""
+			candidateEstimate, reasoningEstimate := estimateVertexPartTokens(part)
+			candidateTokens = saturatingTokenAdd(candidateTokens, candidateEstimate)
+			reasoningTokens = saturatingTokenAdd(reasoningTokens, reasoningEstimate)
+		}
+		candidateTokens = saturatingTokenAdd(candidateTokens, estimateTextTokens(candidateText.String()))
+		reasoningTokens = saturatingTokenAdd(reasoningTokens, estimateTextTokens(reasoningText.String()))
+		return candidateTokens, reasoningTokens
+	}
+
+	var candidateText, reasoningText strings.Builder
+	for _, part := range result.TextParts {
+		if part.Thought {
+			reasoningText.WriteString(part.Text)
+		} else {
+			candidateText.WriteString(part.Text)
+		}
+	}
+	candidateTokens = saturatingTokenAdd(candidateTokens, estimateTextTokens(candidateText.String()))
+	reasoningTokens = saturatingTokenAdd(reasoningTokens, estimateTextTokens(reasoningText.String()))
+	for i := range result.ImageParts {
+		candidateTokens = saturatingTokenAdd(candidateTokens, estimateTokenValue(result.ImageParts[i], "inlineData"))
+	}
+	for i := range result.FunctionCalls {
+		candidateTokens = saturatingTokenAdd(candidateTokens, estimateFunctionCallTokens(&result.FunctionCalls[i]))
+	}
+	return candidateTokens, reasoningTokens
 }
 
 func estimateReasoningTokens(result *proxy.CallResult) int {
-	if result == nil {
+	_, reasoningTokens := estimateCompletionTokenBreakdown(result)
+	return reasoningTokens
+}
+
+func estimateVertexPartTokens(part model.VertexPart) (candidateTokens, reasoningTokens int) {
+	if part.Text != "" {
+		tokens := estimateTextTokens(part.Text)
+		if part.Thought {
+			reasoningTokens = saturatingTokenAdd(reasoningTokens, tokens)
+		} else {
+			candidateTokens = saturatingTokenAdd(candidateTokens, tokens)
+		}
+	}
+	if part.InlineData != nil {
+		candidateTokens = saturatingTokenAdd(candidateTokens, estimateTokenValue(*part.InlineData, "inlineData"))
+	}
+	for _, value := range []map[string]interface{}{
+		part.FileData,
+		part.ExecutableCode,
+		part.CodeExecutionResult,
+	} {
+		if len(value) > 0 {
+			candidateTokens = saturatingTokenAdd(candidateTokens, estimateTokenValue(value, ""))
+		}
+	}
+	if part.FunctionCall != nil {
+		candidateTokens = saturatingTokenAdd(candidateTokens, estimateFunctionCallTokens(part.FunctionCall))
+	}
+	if part.FunctionResponse != nil {
+		candidateTokens = saturatingTokenAdd(candidateTokens, estimateTokenValue(part.FunctionResponse, ""))
+	}
+	return candidateTokens, reasoningTokens
+}
+
+func estimateFunctionCallTokens(call *model.FunctionCall) int {
+	if call == nil {
 		return 0
 	}
-	if len(result.Candidates) > 0 {
-		total := 0
-		for _, candidate := range result.Candidates {
-			total += estimateReasoningTokens(callResultFromCandidate(candidate))
-		}
-		return total
-	}
-	tokens := 0
-	for _, part := range result.TextParts {
-		if part.Thought {
-			tokens += estimateTextTokens(part.Text)
-		}
-	}
-	return tokens
+	// IDs, partial argument deltas, continuation flags, and thought signatures
+	// are transport state rather than generated semantic tool-call content.
+	return estimateTokenValue(map[string]interface{}{
+		"name": call.Name,
+		"args": call.Args,
+	}, "")
 }
 
 func streamResponse(
@@ -439,7 +530,9 @@ func streamResponseForRequestWithProxy(
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	streamState := &openAIStreamState{}
 	aggregate := &proxy.CallResult{}
+	usageRevision := &streamUsageRevision{}
 	committed := false
+	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 
 	ctx := r.Context()
 	err := stream(ctx, func(result *proxy.CallResult) error {
@@ -449,11 +542,15 @@ func streamResponseForRequestWithProxy(
 		if result == nil || result.IsEmpty() {
 			return nil
 		}
+		usageRevision.observe(result)
 		accumulateCallResult(aggregate, result)
 		if !result.HasContent() {
 			return nil
 		}
 		if !committed {
+			if includeUsage {
+				declareUsageEstimateTrailer(w)
+			}
 			setSSEHeaders(w)
 			committed = true
 		}
@@ -479,11 +576,17 @@ func streamResponseForRequestWithProxy(
 		return
 	}
 	if !committed {
+		if includeUsage {
+			declareUsageEstimateTrailer(w)
+		}
 		setSSEHeaders(w)
 	}
 	var usage *model.Usage
-	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		usage, _ = openAIUsage(req, aggregate)
+	if includeUsage {
+		snapshot := usageSnapshot(aggregate, usageRevision)
+		var estimated bool
+		usage, estimated = openAIUsage(req, &snapshot)
+		finishUsageEstimate(w, estimated)
 	}
 	// Emit the protocol terminator only after the upstream stream reaches EOF.
 	// Vertex finishReason is completion metadata and may arrive before later
@@ -1048,12 +1151,16 @@ func convertMessages(modelName string, messages []model.ChatMessage) ([]map[stri
 					{"text": fmt.Sprintf("[Tool Result (%s)]: %s", msg.ToolCallID, extractTextContent(msg.Content))},
 				}
 			} else {
+				functionResponse := map[string]interface{}{
+					"name":     name,
+					"response": parseFunctionResponseContent(msg.Content),
+				}
+				if id := vertexToolCallID(msg.ToolCallID); id != "" {
+					functionResponse["id"] = id
+				}
 				parts = []map[string]interface{}{
 					{
-						"functionResponse": map[string]interface{}{
-							"name":     name,
-							"response": parseFunctionResponseContent(msg.Content),
-						},
+						"functionResponse": functionResponse,
 					},
 				}
 			}
@@ -1122,12 +1229,23 @@ func convertToolCallToFunctionCallPart(toolCall model.ChatToolCall) map[string]i
 		return nil
 	}
 	part := functionCallPart(toolCall.Function.Name, toolCall.Function.Arguments)
+	if id := vertexToolCallID(toolCall.ID); id != "" {
+		part["functionCall"].(map[string]interface{})["id"] = id
+	}
 	if signature := extractToolCallThoughtSignature(toolCall); signature != "" {
 		part["thoughtSignature"] = signature
 	} else {
 		part["thoughtSignature"] = anthropicDummyThoughtSignature
 	}
 	return part
+}
+
+func vertexToolCallID(id string) string {
+	id = strings.TrimSpace(id)
+	if marker := strings.LastIndex(id, openAIToolSignatureMarker); marker >= 0 {
+		id = id[:marker]
+	}
+	return strings.TrimSpace(id)
 }
 
 func functionCallPart(name, arguments string) map[string]interface{} {

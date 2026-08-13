@@ -28,7 +28,11 @@ func TestResponseCompactCodecRoundTripAndAuthentication(t *testing.T) {
 		t.Fatalf("payload = %+v, want %+v", got, want)
 	}
 
-	tampered := sealed[:len(sealed)-1] + "A"
+	replacement := byte('A')
+	if sealed[len(sealed)-1] == replacement {
+		replacement = 'B'
+	}
+	tampered := sealed[:len(sealed)-1] + string(replacement)
 	if _, err := codec.open(tampered); err == nil {
 		t.Fatal("tampered compact payload was accepted")
 	}
@@ -513,7 +517,7 @@ func TestResponsesStreamEmitsLifecycleTextAndFunctionEvents(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
 
-	api.streamResponse(recorder, httpReq, req, chatReq, nil, responseToolBindings{"lookup": {Kind: "function"}}, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, responseToolBindings{"lookup": {Kind: "function"}}, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
 		if err := onChunk(&proxy.CallResult{TextParts: []model.TextPart{{Text: "hel"}}}); err != nil {
 			return err
 		}
@@ -560,6 +564,58 @@ func TestResponsesStreamEmitsLifecycleTextAndFunctionEvents(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamInvalidatesStaleOutputUsage(t *testing.T) {
+	api := NewResponsesAPI(nil, true, "test-secret")
+	req := model.ResponseRequest{Model: "gemini-test", Input: "hello", Stream: true}
+	chatReq := model.ChatCompletionRequest{Model: req.Model, Messages: []model.ChatMessage{{Role: "user", Content: "hello"}}, Stream: true}
+	recorder := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
+
+	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, nil, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+		if err := onChunk(&proxy.CallResult{
+			TextParts: []model.TextPart{{Text: "a"}},
+			UsageMetadata: map[string]interface{}{
+				"promptTokenCount": float64(7), "candidatesTokenCount": float64(1), "totalTokenCount": float64(8),
+			},
+		}); err != nil {
+			return err
+		}
+		return onChunk(&proxy.CallResult{TextParts: []model.TextPart{{Text: strings.Repeat("later output ", 20)}}, FinishReason: "STOP"})
+	})
+
+	events := decodeSSEEventObjects(t, recorder.Body.String(), "response.completed")
+	if len(events) != 1 {
+		t.Fatalf("completed events = %d, want 1\n%s", len(events), recorder.Body.String())
+	}
+	response := events[0]["response"].(map[string]interface{})
+	usage := response["usage"].(map[string]interface{})
+	if got := int(usage["input_tokens"].(float64)); got != 7 {
+		t.Fatalf("input_tokens = %d, want invariant upstream value 7", got)
+	}
+	if got := int(usage["output_tokens"].(float64)); got <= 1 {
+		t.Fatalf("output_tokens = %d, stale upstream value was retained", got)
+	}
+	if got := recorder.Header().Get("X-Usage-Estimated"); got != "true" {
+		t.Fatalf("X-Usage-Estimated = %q, want true", got)
+	}
+}
+
+func TestResponseUsageIncludesCompactionContribution(t *testing.T) {
+	mainResult := &proxy.CallResult{UsageMetadata: map[string]interface{}{
+		"promptTokenCount": float64(10), "candidatesTokenCount": float64(5), "totalTokenCount": float64(15),
+	}}
+	contribution := &openAIUsageContribution{usage: &model.Usage{
+		PromptTokens: 20, CompletionTokens: 4, TotalTokens: 24,
+	}}
+	usage, estimated := responseUsageWithContribution(model.ChatCompletionRequest{}, mainResult, contribution)
+	if estimated {
+		t.Fatal("complete main and compaction usage should remain exact")
+	}
+	if usage.InputTokens != 30 || usage.OutputTokens != 9 || usage.TotalTokens != 39 {
+		t.Fatalf("combined usage = %+v, want input=30 output=9 total=39", usage)
+	}
+}
+
 func TestResponsesStreamEmitsThoughtAsCommentaryTextDeltas(t *testing.T) {
 	api := NewResponsesAPI(nil, true, "test-secret")
 	req := model.ResponseRequest{Model: "gemini-3-pro", Input: "hello", Stream: true}
@@ -567,7 +623,7 @@ func TestResponsesStreamEmitsThoughtAsCommentaryTextDeltas(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
 
-	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, nil, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
 		if err := onChunk(&proxy.CallResult{TextParts: []model.TextPart{{Text: "checking", Thought: true}}}); err != nil {
 			return err
 		}
@@ -612,7 +668,7 @@ func TestResponsesStreamFinishesCommentaryBeforeFunctionCall(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
 
-	api.streamResponse(recorder, httpReq, req, chatReq, nil, responseToolBindings{"lookup": {Kind: "function"}}, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, responseToolBindings{"lookup": {Kind: "function"}}, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
 		return onChunk(&proxy.CallResult{
 			TextParts:     []model.TextPart{{Text: "I should inspect it.", Thought: true}},
 			FunctionCalls: []model.FunctionCall{{ID: "call_1", Name: "lookup", Args: map[string]interface{}{"q": "state"}}},
@@ -635,7 +691,7 @@ func TestResponsesStreamReportsFinishOnlyResultAsFailure(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
 
-	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, nil, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
 		return onChunk(&proxy.CallResult{FinishReason: "STOP"})
 	})
 
@@ -658,7 +714,7 @@ func TestResponsesStreamEmitsErrorWhenEmptyOutputRetriesAreExhausted(t *testing.
 	recorder := httptest.NewRecorder()
 	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
 
-	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, func(_ context.Context, _ func(*proxy.CallResult) error) error {
+	api.streamResponse(recorder, httpReq, req, chatReq, nil, nil, nil, func(_ context.Context, _ func(*proxy.CallResult) error) error {
 		return proxy.ErrNoAssistantOutput
 	})
 

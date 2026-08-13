@@ -44,6 +44,10 @@ func estimateTokenValue(value interface{}, key string) int {
 	case map[string]interface{}:
 		total := 2
 		for childKey, item := range typed {
+			if isImageURLField(childKey) {
+				total += estimateTextTokens(childKey) + estimateImageURLValue(item)
+				continue
+			}
 			total += estimateTextTokens(childKey) + estimateTokenValue(item, childKey)
 		}
 		return total
@@ -51,6 +55,35 @@ func estimateTokenValue(value interface{}, key string) int {
 		return 1
 	default:
 		return estimateJSONTokens(typed)
+	}
+}
+
+func isImageURLField(key string) bool {
+	key = strings.ToLower(strings.ReplaceAll(key, "_", ""))
+	return key == "imageurl"
+}
+
+func estimateImageURLValue(value interface{}) int {
+	switch typed := value.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return 0
+		}
+		return estimatedMediaTokens
+	case map[string]interface{}:
+		total := 0
+		if imageURL, _ := typed["url"].(string); strings.TrimSpace(imageURL) != "" {
+			total = estimatedMediaTokens
+		}
+		for key, item := range typed {
+			if key == "url" {
+				continue
+			}
+			total += estimateTextTokens(key) + estimateTokenValue(item, key)
+		}
+		return total
+	default:
+		return estimateTokenValue(value, "image_url")
 	}
 }
 
@@ -72,48 +105,64 @@ func estimateTextTokens(text string) int {
 }
 
 func isMediaPayload(key, value string) bool {
+	value = strings.TrimSpace(value)
+	prefix := value
+	if len(prefix) > 32 {
+		prefix = prefix[:32]
+	}
+	prefix = strings.ToLower(prefix)
+	if strings.HasPrefix(prefix, "data:image/") || strings.HasPrefix(prefix, "data:application/pdf") {
+		return true
+	}
+
 	key = strings.ToLower(strings.ReplaceAll(key, "_", ""))
-	if key != "data" && key != "filedata" && key != "image" && key != "source" {
+	if key != "data" && key != "filedata" && key != "fileuri" && key != "image" && key != "source" {
 		return false
 	}
-	if strings.HasPrefix(value, "data:image/") || strings.HasPrefix(value, "data:application/pdf") {
-		return true
+	if key == "fileuri" {
+		return value != ""
 	}
 	if len(value) < 64 {
 		return false
 	}
-	_, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
+	_, err := base64.StdEncoding.DecodeString(value)
 	if err == nil {
 		return true
 	}
-	_, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(value))
+	_, err = base64.RawStdEncoding.DecodeString(value)
 	return err == nil
 }
 
 func usageMetadataInt(metadata map[string]interface{}, key string) int {
+	value, _ := usageMetadataIntOK(metadata, key)
+	return value
+}
+
+func usageMetadataIntOK(metadata map[string]interface{}, key string) (int, bool) {
 	value, ok := metadata[key]
 	if !ok {
-		return 0
+		return 0, false
 	}
 	switch typed := value.(type) {
 	case float64:
-		return clampUsageFloat(typed)
+		return clampUsageFloat(typed), !math.IsNaN(typed) && !math.IsInf(typed, 0) && typed >= 0
 	case float32:
-		return clampUsageFloat(float64(typed))
+		value := float64(typed)
+		return clampUsageFloat(value), !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 	case int:
-		return maxInt(0, typed)
+		return maxInt(0, typed), typed >= 0
 	case int32:
-		return clampUsageSigned(int64(typed))
+		return clampUsageSigned(int64(typed)), typed >= 0
 	case int64:
-		return clampUsageSigned(typed)
+		return clampUsageSigned(typed), typed >= 0
 	case uint:
-		return clampUsageUnsigned(uint64(typed))
+		return clampUsageUnsigned(uint64(typed)), true
 	case uint32:
-		return clampUsageUnsigned(uint64(typed))
+		return clampUsageUnsigned(uint64(typed)), true
 	case uint64:
-		return clampUsageUnsigned(typed)
+		return clampUsageUnsigned(typed), true
 	default:
-		return 0
+		return 0, false
 	}
 }
 
@@ -165,105 +214,288 @@ func saturatingTokenAdd(a, b int) int {
 	return a + b
 }
 
-func openAIUsage(req model.ChatCompletionRequest, result *proxy.CallResult) (*model.Usage, bool) {
-	promptTokens := estimateOpenAIPromptTokens(req)
-	completionTokens := estimateOpenAICompletionTokens(result)
-	reasoningTokens := estimateReasoningTokens(result)
-	estimated := true
+// streamUsageRevision keeps an upstream cumulative usage measurement valid
+// only while no subsequently received assistant output can change it.
+type streamUsageRevision struct {
+	outputRevision uint64
+	metadataAt     uint64
+	metadata       map[string]interface{}
+}
 
+func (s *streamUsageRevision) observe(result *proxy.CallResult) {
+	if s == nil || result == nil {
+		return
+	}
+	if estimateOpenAICompletionTokens(result) > 0 {
+		s.outputRevision++
+	}
+	if len(result.UsageMetadata) > 0 {
+		s.metadata = cloneUsageMetadata(result.UsageMetadata)
+		s.metadataAt = s.outputRevision
+	}
+}
+
+func (s *streamUsageRevision) currentMetadata() map[string]interface{} {
+	if s == nil || len(s.metadata) == 0 {
+		return nil
+	}
+	if s.metadataAt != s.outputRevision {
+		// Prompt and cache measurements are invariant for the lifetime of one
+		// generation. Output and total counters become stale after another delta.
+		invariant := make(map[string]interface{})
+		for _, key := range []string{
+			"promptTokenCount", "cachedContentTokenCount",
+			"promptTokensDetails", "cacheTokensDetails", "serviceTier",
+		} {
+			if value, ok := s.metadata[key]; ok {
+				invariant[key] = value
+			}
+		}
+		return invariant
+	}
+	return cloneUsageMetadata(s.metadata)
+}
+
+func cloneUsageMetadata(metadata map[string]interface{}) map[string]interface{} {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]interface{}, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func usageSnapshot(aggregate *proxy.CallResult, revision *streamUsageRevision) proxy.CallResult {
+	if aggregate == nil {
+		return proxy.CallResult{}
+	}
+	snapshot := *aggregate
+	snapshot.UsageMetadata = revision.currentMetadata()
+	return snapshot
+}
+
+type resolvedVertexUsage struct {
+	prompt, candidates, thoughts, total                     int
+	promptExact, candidatesExact, thoughtsExact, totalExact bool
+}
+
+func usageMetadata(result *proxy.CallResult) map[string]interface{} {
+	if result == nil {
+		return nil
+	}
+	return result.UsageMetadata
+}
+
+func resolveVertexUsage(estimatedPrompt, estimatedCandidates, estimatedThoughts int, metadata map[string]interface{}) resolvedVertexUsage {
+	resolved := resolvedVertexUsage{
+		prompt:     estimatedPrompt,
+		candidates: estimatedCandidates,
+		thoughts:   estimatedThoughts,
+	}
+	if value, ok := usageMetadataIntOK(metadata, "promptTokenCount"); ok {
+		resolved.prompt, resolved.promptExact = value, true
+	}
+	if value, ok := usageMetadataIntOK(metadata, "candidatesTokenCount"); ok {
+		resolved.candidates, resolved.candidatesExact = value, true
+	}
+	if value, ok := usageMetadataIntOK(metadata, "thoughtsTokenCount"); ok {
+		resolved.thoughts, resolved.thoughtsExact = value, true
+	}
+	if value, ok := usageMetadataIntOK(metadata, "totalTokenCount"); ok {
+		resolved.total, resolved.totalExact = value, true
+	}
+
+	if !resolved.totalExact {
+		if _, reported := metadata["thoughtsTokenCount"]; !reported && resolved.thoughts == 0 {
+			// Vertex omits thoughtsTokenCount when no reasoning tokens were used.
+			resolved.thoughtsExact = true
+		}
+		resolved.total = saturatingTokenAdd(
+			resolved.prompt,
+			saturatingTokenAdd(resolved.candidates, resolved.thoughts),
+		)
+		resolved.totalExact = resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact
+		return resolved
+	}
+
+	if resolved.promptExact {
+		outputTotal := nonNegativeTokenDifference(resolved.total, resolved.prompt)
+		switch {
+		case resolved.candidatesExact && resolved.thoughtsExact:
+			// The component counters define totalTokenCount. Normalize a malformed
+			// contradictory total rather than returning an impossible breakdown.
+			resolved.total = saturatingTokenAdd(resolved.prompt, saturatingTokenAdd(resolved.candidates, resolved.thoughts))
+		case resolved.candidatesExact && !resolved.thoughtsExact:
+			resolved.thoughts = nonNegativeTokenDifference(outputTotal, resolved.candidates)
+			resolved.thoughtsExact = true
+		case !resolved.candidatesExact && resolved.thoughtsExact:
+			resolved.candidates = nonNegativeTokenDifference(outputTotal, resolved.thoughts)
+			resolved.candidatesExact = true
+		case !resolved.candidatesExact && !resolved.thoughtsExact:
+			resolved.thoughts = minInt(resolved.thoughts, outputTotal)
+			resolved.candidates = outputTotal - resolved.thoughts
+		}
+		return resolved
+	}
+
+	completion := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
+	resolved.prompt = nonNegativeTokenDifference(resolved.total, completion)
+	if resolved.candidatesExact && resolved.thoughtsExact {
+		resolved.promptExact = true
+	}
+	return resolved
+}
+
+func nonNegativeTokenDifference(total, used int) int {
+	if total <= used {
+		return 0
+	}
+	return total - used
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func openAIUsage(req model.ChatCompletionRequest, result *proxy.CallResult) (*model.Usage, bool) {
+	estimatedCandidates, estimatedReasoning := estimateCompletionTokenBreakdown(result)
+	resolved := resolveVertexUsage(estimateOpenAIPromptTokens(req), estimatedCandidates, estimatedReasoning, usageMetadata(result))
 	var cachedTokens int
 	if result != nil && len(result.UsageMetadata) > 0 {
-		metadata := result.UsageMetadata
-		if value := usageMetadataInt(metadata, "promptTokenCount"); value > 0 {
-			promptTokens = value
-			estimated = false
-		}
-		candidateTokens := usageMetadataInt(metadata, "candidatesTokenCount")
-		thoughtTokens := usageMetadataInt(metadata, "thoughtsTokenCount")
-		if candidateTokens > 0 || thoughtTokens > 0 {
-			completionTokens = saturatingTokenAdd(candidateTokens, thoughtTokens)
-			reasoningTokens = thoughtTokens
-			estimated = false
-		}
-		cachedTokens = usageMetadataInt(metadata, "cachedContentTokenCount")
+		cachedTokens = usageMetadataInt(result.UsageMetadata, "cachedContentTokenCount")
 	}
 
-	totalTokens := saturatingTokenAdd(promptTokens, completionTokens)
-	if result != nil {
-		if upstreamTotal := usageMetadataInt(result.UsageMetadata, "totalTokenCount"); upstreamTotal > 0 {
-			totalTokens = upstreamTotal
-			estimated = false
-		}
-	}
+	completionTokens := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
+	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.totalExact)
 	usage := &model.Usage{
-		PromptTokens:     promptTokens,
+		PromptTokens:     resolved.prompt,
 		CompletionTokens: completionTokens,
-		TotalTokens:      totalTokens,
+		TotalTokens:      resolved.total,
 	}
 	if cachedTokens > 0 {
 		usage.PromptTokensDetails = &model.PromptTokensDetails{CachedTokens: cachedTokens}
 	}
-	if reasoningTokens > 0 {
-		usage.CompletionTokensDetails = &model.CompletionTokensDetails{ReasoningTokens: reasoningTokens}
+	if resolved.thoughts > 0 {
+		usage.CompletionTokensDetails = &model.CompletionTokensDetails{ReasoningTokens: resolved.thoughts}
 	}
 	return usage, estimated
 }
 
+type openAIUsageContribution struct {
+	usage     *model.Usage
+	estimated bool
+}
+
+func combineOpenAIUsage(usages ...*model.Usage) *model.Usage {
+	combined := &model.Usage{}
+	for _, usage := range usages {
+		if usage == nil {
+			continue
+		}
+		combined.PromptTokens = saturatingTokenAdd(combined.PromptTokens, usage.PromptTokens)
+		combined.CompletionTokens = saturatingTokenAdd(combined.CompletionTokens, usage.CompletionTokens)
+		combined.TotalTokens = saturatingTokenAdd(combined.TotalTokens, usage.TotalTokens)
+		if usage.PromptTokensDetails != nil {
+			if combined.PromptTokensDetails == nil {
+				combined.PromptTokensDetails = &model.PromptTokensDetails{}
+			}
+			combined.PromptTokensDetails.CachedTokens = saturatingTokenAdd(
+				combined.PromptTokensDetails.CachedTokens,
+				usage.PromptTokensDetails.CachedTokens,
+			)
+		}
+		if usage.CompletionTokensDetails != nil {
+			if combined.CompletionTokensDetails == nil {
+				combined.CompletionTokensDetails = &model.CompletionTokensDetails{}
+			}
+			combined.CompletionTokensDetails.ReasoningTokens = saturatingTokenAdd(
+				combined.CompletionTokensDetails.ReasoningTokens,
+				usage.CompletionTokensDetails.ReasoningTokens,
+			)
+		}
+	}
+	return combined
+}
+
 func anthropicUsage(req model.AnthropicMessageRequest, result *proxy.CallResult) (*model.AnthropicUsage, bool) {
-	inputTokens := estimateAnthropicInputTokens(req)
-	outputTokens := estimateAnthropicOutputTokens(result)
-	thinkingTokens := estimateReasoningTokens(result)
-	estimated := true
+	estimatedCandidates, estimatedThinking := estimateCompletionTokenBreakdown(result)
+	resolved := resolveVertexUsage(estimateAnthropicInputTokens(req), estimatedCandidates, estimatedThinking, usageMetadata(result))
 	cachedTokens := 0
 
 	if result != nil && len(result.UsageMetadata) > 0 {
-		if value := usageMetadataInt(result.UsageMetadata, "promptTokenCount"); value > 0 {
-			inputTokens = value
-			estimated = false
-		}
-		candidateTokens := usageMetadataInt(result.UsageMetadata, "candidatesTokenCount")
-		thinkingTokens = usageMetadataInt(result.UsageMetadata, "thoughtsTokenCount")
-		if candidateTokens > 0 || thinkingTokens > 0 {
-			outputTokens = saturatingTokenAdd(candidateTokens, thinkingTokens)
-			estimated = false
-		}
 		cachedTokens = usageMetadataInt(result.UsageMetadata, "cachedContentTokenCount")
 	}
 
-	usage := &model.AnthropicUsage{InputTokens: inputTokens, OutputTokens: outputTokens}
-	if usage.OutputTokens == 0 && result != nil && (req.MaxTokens == nil || *req.MaxTokens != 0) {
+	outputTokens := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
+	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact)
+	usage := &model.AnthropicUsage{InputTokens: resolved.prompt, OutputTokens: outputTokens}
+	if usage.OutputTokens == 0 && !resolved.candidatesExact && result != nil && (req.MaxTokens == nil || *req.MaxTokens != 0) {
 		usage.OutputTokens = 1
 	}
 	if cachedTokens > 0 {
-		usage.InputTokens = maxInt(0, inputTokens-cachedTokens)
+		usage.InputTokens = maxInt(0, resolved.prompt-cachedTokens)
 		usage.CacheReadInputTokens = cachedTokens
 	}
-	if thinkingTokens > 0 {
-		usage.OutputTokensDetails = &model.AnthropicOutputTokensDetails{ThinkingTokens: thinkingTokens}
+	if resolved.thoughts > 0 {
+		usage.OutputTokensDetails = &model.AnthropicOutputTokensDetails{ThinkingTokens: resolved.thoughts}
 	}
 	return usage, estimated
 }
 
 func geminiUsageMetadata(input interface{}, result *proxy.CallResult) (map[string]interface{}, bool) {
-	if result != nil && len(result.UsageMetadata) > 0 {
-		metadata := make(map[string]interface{}, len(result.UsageMetadata))
-		for key, value := range result.UsageMetadata {
-			metadata[key] = value
-		}
-		return metadata, false
+	return geminiUsageMetadataWithPromptEstimate(estimateJSONTokens(input), result)
+}
+
+func geminiUsageMetadataWithPromptEstimate(estimatedPrompt int, result *proxy.CallResult) (map[string]interface{}, bool) {
+	estimatedCandidates, estimatedThoughts := estimateCompletionTokenBreakdown(result)
+	upstream := usageMetadata(result)
+	resolved := resolveVertexUsage(estimatedPrompt, estimatedCandidates, estimatedThoughts, upstream)
+	metadata := cloneUsageMetadata(upstream)
+	if metadata == nil {
+		metadata = make(map[string]interface{})
 	}
+	setResolvedUsageField(metadata, upstream, "promptTokenCount", resolved.prompt)
+	setResolvedUsageField(metadata, upstream, "candidatesTokenCount", resolved.candidates)
+	if resolved.thoughts > 0 || upstreamHasNumericUsageField(upstream, "thoughtsTokenCount") {
+		setResolvedUsageField(metadata, upstream, "thoughtsTokenCount", resolved.thoughts)
+	} else {
+		delete(metadata, "thoughtsTokenCount")
+	}
+	setResolvedUsageField(metadata, upstream, "totalTokenCount", resolved.total)
+	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.totalExact)
+	return metadata, estimated
+}
+
+func estimateGeminiUsageMetadata(input interface{}, result *proxy.CallResult) map[string]interface{} {
+	candidateTokens, thoughtTokens := estimateCompletionTokenBreakdown(result)
 	promptTokens := estimateJSONTokens(input)
-	thoughtTokens := estimateReasoningTokens(result)
-	candidateTokens := maxInt(0, estimateOpenAICompletionTokens(result)-thoughtTokens)
 	metadata := map[string]interface{}{
 		"promptTokenCount":     promptTokens,
 		"candidatesTokenCount": candidateTokens,
-		"totalTokenCount":      saturatingTokenAdd(promptTokens, candidateTokens),
+		"totalTokenCount":      saturatingTokenAdd(saturatingTokenAdd(promptTokens, candidateTokens), thoughtTokens),
 	}
 	if thoughtTokens > 0 {
 		metadata["thoughtsTokenCount"] = thoughtTokens
 	}
-	return metadata, true
+	return metadata
+}
+
+func upstreamHasNumericUsageField(metadata map[string]interface{}, key string) bool {
+	_, ok := usageMetadataIntOK(metadata, key)
+	return ok
+}
+
+func setResolvedUsageField(dst, upstream map[string]interface{}, key string, value int) {
+	if upstreamValue, ok := usageMetadataIntOK(upstream, key); ok && upstreamValue == value {
+		dst[key] = upstream[key]
+		return
+	}
+	dst[key] = value
 }
 
 func maxInt(a, b int) int {

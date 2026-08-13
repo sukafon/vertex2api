@@ -659,6 +659,7 @@ func reconcileFunctionCallHistory(modelName string, contents []map[string]interf
 		if functionHistoryPairsAlreadyAligned(calls, responses, pairs) {
 			continue
 		}
+		incomplete := len(pairs) != len(calls) || len(pairs) != len(responses)
 
 		matchedCalls := make(map[int]bool, len(pairs))
 		matchedResponses := make([]interface{}, 0, len(pairs))
@@ -687,13 +688,19 @@ func reconcileFunctionCallHistory(modelName string, contents []map[string]interf
 			contents[responseTurn]["parts"] = filteredResponseParts
 		}
 
-		log.Warn().
+		logEvent := log.Debug()
+		message := "Reordered function responses before Vertex request"
+		if incomplete {
+			logEvent = log.Warn()
+			message = "Repaired incomplete function call history before Vertex request"
+		}
+		logEvent.
 			Str("model", modelName).
 			Int("turn", turn).
 			Int("function_calls", len(calls)).
 			Int("function_responses", len(responses)).
 			Int("matched_pairs", len(pairs)).
-			Msg("Repaired incomplete function call history before Vertex request")
+			Msg(message)
 	}
 
 	filtered := make([]map[string]interface{}, 0, len(contents))

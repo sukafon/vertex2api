@@ -62,7 +62,9 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamResponseRedaction(t *testing.T) {
 	t.Setenv("RANDOM_FINGERPRINT", "")
 	t.Setenv("TLS_CLIENT_PROFILE", "")
 	t.Setenv("ALLOW_CUSTOM_MODEL_NAMES", "")
+	t.Setenv("GEMINI_STRICT_ALT_SSE", "")
 	t.Setenv("REJECT_CHAT_LIVENESS_PROBES", "")
+	t.Setenv("RESPOND_CHAT_LIVENESS_PROBES", "")
 	cfg := Load()
 
 	if !cfg.AutoFetchModels {
@@ -83,8 +85,14 @@ func TestLoadDefaultsAutoFetchModelsAndUpstreamResponseRedaction(t *testing.T) {
 	if cfg.AllowCustomModelNames {
 		t.Fatal("ALLOW_CUSTOM_MODEL_NAMES default = true, want false")
 	}
+	if cfg.GeminiStrictAltSSE {
+		t.Fatal("GEMINI_STRICT_ALT_SSE default = true, want false")
+	}
 	if cfg.RejectChatLivenessProbe {
 		t.Fatal("REJECT_CHAT_LIVENESS_PROBES default = true, want false")
+	}
+	if cfg.ReplyChatLivenessProbe {
+		t.Fatal("RESPOND_CHAT_LIVENESS_PROBES default = true, want false")
 	}
 }
 
@@ -113,6 +121,13 @@ func TestLoadCanEnableChatLivenessProbeRejection(t *testing.T) {
 	t.Setenv("REJECT_CHAT_LIVENESS_PROBES", "true")
 	if cfg := Load(); !cfg.RejectChatLivenessProbe {
 		t.Fatal("REJECT_CHAT_LIVENESS_PROBES = false, want true")
+	}
+}
+
+func TestLoadCanEnableConstructedChatLivenessProbeResponses(t *testing.T) {
+	t.Setenv("RESPOND_CHAT_LIVENESS_PROBES", "true")
+	if cfg := Load(); !cfg.ReplyChatLivenessProbe {
+		t.Fatal("RESPOND_CHAT_LIVENESS_PROBES = false, want true")
 	}
 }
 
@@ -177,6 +192,13 @@ func TestLoadAllowsCustomModelNamesWhenConfigured(t *testing.T) {
 	t.Setenv("ALLOW_CUSTOM_MODEL_NAMES", "true")
 	if cfg := Load(); !cfg.AllowCustomModelNames {
 		t.Fatal("ALLOW_CUSTOM_MODEL_NAMES = false, want true")
+	}
+}
+
+func TestLoadCanRequireGeminiAltSSE(t *testing.T) {
+	t.Setenv("GEMINI_STRICT_ALT_SSE", "true")
+	if cfg := Load(); !cfg.GeminiStrictAltSSE {
+		t.Fatal("GEMINI_STRICT_ALT_SSE = false, want true")
 	}
 }
 
