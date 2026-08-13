@@ -145,8 +145,20 @@ func TestOpenAIStreamIncludeUsageWritesFinalUsageChunk(t *testing.T) {
 		}})
 	})
 	body := rec.Body.String()
-	if !strings.Contains(body, `"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7`) {
-		t.Fatalf("missing final usage chunk: %s", body)
+	objects := decodeStreamDataObjects(t, body)
+	if len(objects) != 2 {
+		t.Fatalf("stream chunks = %d, want content and final chunks: %s", len(objects), body)
+	}
+	if _, ok := objects[0]["usage"]; ok {
+		t.Fatalf("intermediate chunk must omit usage: %#v", objects[0])
+	}
+	usage, ok := objects[1]["usage"].(map[string]interface{})
+	if !ok || usage["prompt_tokens"] != float64(5) || usage["completion_tokens"] != float64(2) || usage["total_tokens"] != float64(7) {
+		t.Fatalf("final usage = %#v, want complete 5/2/7 counters: %s", objects[1]["usage"], body)
+	}
+	choices, ok := objects[1]["choices"].([]interface{})
+	if !ok || len(choices) != 1 {
+		t.Fatalf("final usage must share the choice-bearing end chunk: %#v", objects[1])
 	}
 	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
 		t.Fatalf("stream does not end with [DONE]: %s", body)

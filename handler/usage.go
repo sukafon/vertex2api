@@ -277,8 +277,8 @@ func usageSnapshot(aggregate *proxy.CallResult, revision *streamUsageRevision) p
 }
 
 type resolvedVertexUsage struct {
-	prompt, candidates, thoughts, total                     int
-	promptExact, candidatesExact, thoughtsExact, totalExact bool
+	prompt, candidates, thoughts, toolUse, total                          int
+	promptExact, candidatesExact, thoughtsExact, toolUseExact, totalExact bool
 }
 
 func usageMetadata(result *proxy.CallResult) map[string]interface{} {
@@ -290,9 +290,10 @@ func usageMetadata(result *proxy.CallResult) map[string]interface{} {
 
 func resolveVertexUsage(estimatedPrompt, estimatedCandidates, estimatedThoughts int, metadata map[string]interface{}) resolvedVertexUsage {
 	resolved := resolvedVertexUsage{
-		prompt:     estimatedPrompt,
-		candidates: estimatedCandidates,
-		thoughts:   estimatedThoughts,
+		prompt:       estimatedPrompt,
+		candidates:   estimatedCandidates,
+		thoughts:     estimatedThoughts,
+		toolUseExact: true,
 	}
 	if value, ok := usageMetadataIntOK(metadata, "promptTokenCount"); ok {
 		resolved.prompt, resolved.promptExact = value, true
@@ -302,6 +303,11 @@ func resolveVertexUsage(estimatedPrompt, estimatedCandidates, estimatedThoughts 
 	}
 	if value, ok := usageMetadataIntOK(metadata, "thoughtsTokenCount"); ok {
 		resolved.thoughts, resolved.thoughtsExact = value, true
+	}
+	if value, ok := usageMetadataIntOK(metadata, "toolUsePromptTokenCount"); ok {
+		resolved.toolUse = value
+	} else if _, reported := metadata["toolUsePromptTokenCount"]; reported {
+		resolved.toolUseExact = false
 	}
 	if value, ok := usageMetadataIntOK(metadata, "totalTokenCount"); ok {
 		resolved.total, resolved.totalExact = value, true
@@ -313,20 +319,20 @@ func resolveVertexUsage(estimatedPrompt, estimatedCandidates, estimatedThoughts 
 			resolved.thoughtsExact = true
 		}
 		resolved.total = saturatingTokenAdd(
-			resolved.prompt,
+			saturatingTokenAdd(resolved.prompt, resolved.toolUse),
 			saturatingTokenAdd(resolved.candidates, resolved.thoughts),
 		)
-		resolved.totalExact = resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact
+		resolved.totalExact = resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.toolUseExact
 		return resolved
 	}
 
 	if resolved.promptExact {
-		outputTotal := nonNegativeTokenDifference(resolved.total, resolved.prompt)
+		outputTotal := nonNegativeTokenDifference(
+			nonNegativeTokenDifference(resolved.total, resolved.prompt),
+			resolved.toolUse,
+		)
 		switch {
 		case resolved.candidatesExact && resolved.thoughtsExact:
-			// The component counters define totalTokenCount. Normalize a malformed
-			// contradictory total rather than returning an impossible breakdown.
-			resolved.total = saturatingTokenAdd(resolved.prompt, saturatingTokenAdd(resolved.candidates, resolved.thoughts))
 		case resolved.candidatesExact && !resolved.thoughtsExact:
 			resolved.thoughts = nonNegativeTokenDifference(outputTotal, resolved.candidates)
 			resolved.thoughtsExact = true
@@ -337,12 +343,39 @@ func resolveVertexUsage(estimatedPrompt, estimatedCandidates, estimatedThoughts 
 			resolved.thoughts = minInt(resolved.thoughts, outputTotal)
 			resolved.candidates = outputTotal - resolved.thoughts
 		}
+
+		componentInput := saturatingTokenAdd(resolved.prompt, resolved.toolUse)
+		componentOutput := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
+		componentTotal := saturatingTokenAdd(componentInput, componentOutput)
+		switch {
+		case resolved.total > componentTotal:
+			// Preserve unexplained upstream billable tokens instead of silently
+			// shrinking total_tokens. Unknown buckets are input-side accounting:
+			// putting them in completion would make deterministic output usage vary.
+			resolved.toolUse = saturatingTokenAdd(resolved.toolUse, resolved.total-componentTotal)
+			resolved.toolUseExact = false
+		case resolved.total < componentTotal:
+			// Preserve the larger complete component breakdown when the reported
+			// total is impossible, and make the inconsistency observable as estimated.
+			resolved.total = componentTotal
+			resolved.totalExact = false
+		}
 		return resolved
 	}
 
-	completion := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
-	resolved.prompt = nonNegativeTokenDifference(resolved.total, completion)
-	if resolved.candidatesExact && resolved.thoughtsExact {
+	nonPrompt := saturatingTokenAdd(
+		resolved.toolUse,
+		saturatingTokenAdd(resolved.candidates, resolved.thoughts),
+	)
+	if resolved.total < nonPrompt {
+		resolved.prompt = 0
+		resolved.total = nonPrompt
+		resolved.totalExact = false
+		resolved.promptExact = false
+		return resolved
+	}
+	resolved.prompt = resolved.total - nonPrompt
+	if resolved.candidatesExact && resolved.thoughtsExact && resolved.toolUseExact {
 		resolved.promptExact = true
 	}
 	return resolved
@@ -369,21 +402,73 @@ func openAIUsage(req model.ChatCompletionRequest, result *proxy.CallResult) (*mo
 	if result != nil && len(result.UsageMetadata) > 0 {
 		cachedTokens = usageMetadataInt(result.UsageMetadata, "cachedContentTokenCount")
 	}
+	cacheExact := true
+	if cachedTokens > resolved.prompt {
+		cachedTokens = resolved.prompt
+		cacheExact = false
+	}
 
+	promptTokens := saturatingTokenAdd(resolved.prompt, resolved.toolUse)
 	completionTokens := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
-	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.totalExact)
+	reasoningBudgetExhausted := result != nil &&
+		strings.EqualFold(result.FinishReason, "MAX_TOKENS") &&
+		estimatedCandidates == 0 && resolved.thoughts > 0
+	reasoningTokens, reasoningExact := openAIReasoningTokenDetails(
+		resolved, estimatedCandidates, estimatedReasoning, reasoningBudgetExhausted,
+	)
+	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.toolUseExact && resolved.totalExact && cacheExact && reasoningExact)
 	usage := &model.Usage{
-		PromptTokens:     resolved.prompt,
+		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      resolved.total,
 	}
 	if cachedTokens > 0 {
 		usage.PromptTokensDetails = &model.PromptTokensDetails{CachedTokens: cachedTokens}
 	}
-	if resolved.thoughts > 0 {
-		usage.CompletionTokensDetails = &model.CompletionTokensDetails{ReasoningTokens: resolved.thoughts}
+	if reasoningTokens > 0 {
+		usage.CompletionTokensDetails = &model.CompletionTokensDetails{ReasoningTokens: reasoningTokens}
 	}
 	return usage, estimated
+}
+
+// openAIReasoningTokenDetails maps both internal Vertex thinking tokens and
+// candidate tokens returned as thought parts to OpenAI reasoning_tokens.
+// candidatesTokenCount covers every returned candidate part, so an all-thought
+// response can be split exactly. Mixed visible/thought output needs a
+// proportional estimate because Vertex does not expose that candidate split.
+func openAIReasoningTokenDetails(
+	resolved resolvedVertexUsage,
+	estimatedCandidates, estimatedReasoning int,
+	reasoningBudgetExhausted bool,
+) (int, bool) {
+	completionTokens := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
+	reasoningTokens := minInt(resolved.thoughts, completionTokens)
+	breakdownExact := resolved.thoughtsExact
+	if (estimatedReasoning <= 0 && !reasoningBudgetExhausted) || resolved.candidates <= 0 {
+		return reasoningTokens, breakdownExact
+	}
+	if !resolved.thoughtsExact || !resolved.candidatesExact {
+		return reasoningTokens, false
+	}
+
+	returnedReasoning := 0
+	if estimatedCandidates <= 0 {
+		// Every returned candidate token is reasoning when the response contains
+		// only thought parts, or when thinking exhausts the output budget before
+		// any visible candidate is produced.
+		returnedReasoning = resolved.candidates
+	} else {
+		estimatedTotal := saturatingTokenAdd(estimatedCandidates, estimatedReasoning)
+		if estimatedTotal > 0 {
+			share := float64(resolved.candidates) * float64(estimatedReasoning) / float64(estimatedTotal)
+			returnedReasoning = int(math.Round(share))
+			returnedReasoning = maxInt(1, minInt(returnedReasoning, resolved.candidates))
+		}
+		breakdownExact = false
+	}
+
+	reasoningTokens = saturatingTokenAdd(reasoningTokens, returnedReasoning)
+	return minInt(reasoningTokens, completionTokens), breakdownExact
 }
 
 type openAIUsageContribution struct {
@@ -431,14 +516,15 @@ func anthropicUsage(req model.AnthropicMessageRequest, result *proxy.CallResult)
 		cachedTokens = usageMetadataInt(result.UsageMetadata, "cachedContentTokenCount")
 	}
 
+	inputTokens := saturatingTokenAdd(resolved.prompt, resolved.toolUse)
 	outputTokens := saturatingTokenAdd(resolved.candidates, resolved.thoughts)
-	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact)
-	usage := &model.AnthropicUsage{InputTokens: resolved.prompt, OutputTokens: outputTokens}
+	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.toolUseExact)
+	usage := &model.AnthropicUsage{InputTokens: inputTokens, OutputTokens: outputTokens}
 	if usage.OutputTokens == 0 && !resolved.candidatesExact && result != nil && (req.MaxTokens == nil || *req.MaxTokens != 0) {
 		usage.OutputTokens = 1
 	}
 	if cachedTokens > 0 {
-		usage.InputTokens = maxInt(0, resolved.prompt-cachedTokens)
+		usage.InputTokens = maxInt(0, inputTokens-cachedTokens)
 		usage.CacheReadInputTokens = cachedTokens
 	}
 	if resolved.thoughts > 0 {
@@ -461,13 +547,18 @@ func geminiUsageMetadataWithPromptEstimate(estimatedPrompt int, result *proxy.Ca
 	}
 	setResolvedUsageField(metadata, upstream, "promptTokenCount", resolved.prompt)
 	setResolvedUsageField(metadata, upstream, "candidatesTokenCount", resolved.candidates)
+	if resolved.toolUse > 0 || upstreamHasNumericUsageField(upstream, "toolUsePromptTokenCount") {
+		setResolvedUsageField(metadata, upstream, "toolUsePromptTokenCount", resolved.toolUse)
+	} else {
+		delete(metadata, "toolUsePromptTokenCount")
+	}
 	if resolved.thoughts > 0 || upstreamHasNumericUsageField(upstream, "thoughtsTokenCount") {
 		setResolvedUsageField(metadata, upstream, "thoughtsTokenCount", resolved.thoughts)
 	} else {
 		delete(metadata, "thoughtsTokenCount")
 	}
 	setResolvedUsageField(metadata, upstream, "totalTokenCount", resolved.total)
-	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.totalExact)
+	estimated := !(resolved.promptExact && resolved.candidatesExact && resolved.thoughtsExact && resolved.toolUseExact && resolved.totalExact)
 	return metadata, estimated
 }
 

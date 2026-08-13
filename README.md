@@ -61,6 +61,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+Chat Completions 流式响应保持同一 `id` 和 `created`，每个 `delta` 都显式返回 `role: "assistant"`、`content`、`reasoning_content` 和 `tool_calls`；后两项无内容时为 `null`，有内容时返回实际思考文本或工具调用数组，并以 `data: [DONE]` 结束。中间 chunk 始终省略 `usage`；仅当请求设置 `stream_options.include_usage=true` 时，`[DONE]` 前包含结束原因的最后一个消息 chunk 才返回完整 usage。`include_obfuscation` 默认开启，可显式设为 `false`。上游提供完整且自洽的 Vertex usage 时直接映射；缺失、过期或自相矛盾时会补全并通过 `X-Usage-Estimated: true` 标记。
+
 Responses（包括 Codex 使用的无状态工具循环）也可直接调用：
 
 ```bash

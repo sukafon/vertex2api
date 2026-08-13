@@ -203,6 +203,165 @@ func TestOpenAIUsageDerivesMissingThoughtsFromExactTotal(t *testing.T) {
 	}
 }
 
+func TestOpenAIUsagePreservesUnclassifiedUpstreamTokens(t *testing.T) {
+	result := &proxy.CallResult{UsageMetadata: map[string]interface{}{
+		"promptTokenCount":     float64(10),
+		"candidatesTokenCount": float64(4),
+		"thoughtsTokenCount":   float64(2),
+		"totalTokenCount":      float64(20),
+	}}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if !estimated {
+		t.Fatal("contradictory upstream usage must be marked estimated")
+	}
+	if usage.PromptTokens != 14 || usage.CompletionTokens != 6 || usage.TotalTokens != 20 {
+		t.Fatalf("usage = %+v, want unclassified tokens mapped to input: prompt=14 completion=6 total=20", usage)
+	}
+	if usage.CompletionTokensDetails == nil || usage.CompletionTokensDetails.ReasoningTokens != 2 {
+		t.Fatalf("reasoning breakdown was lost: %+v", usage)
+	}
+}
+
+func TestOpenAIUsageMapsVertexToolUseTokensToPrompt(t *testing.T) {
+	result := &proxy.CallResult{UsageMetadata: map[string]interface{}{
+		"promptTokenCount":        float64(10),
+		"toolUsePromptTokenCount": float64(3),
+		"candidatesTokenCount":    float64(4),
+		"thoughtsTokenCount":      float64(2),
+		"totalTokenCount":         float64(19),
+	}}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if estimated {
+		t.Fatal("complete upstream usage should remain exact")
+	}
+	if usage.PromptTokens != 13 || usage.CompletionTokens != 6 || usage.TotalTokens != 19 {
+		t.Fatalf("usage = %+v, want prompt=13 completion=6 total=19", usage)
+	}
+}
+
+func TestOpenAIUsageCountsReturnedThoughtCandidatesAsReasoning(t *testing.T) {
+	result := &proxy.CallResult{
+		TextParts: []model.TextPart{{Text: "private reasoning summary", Thought: true}},
+		UsageMetadata: map[string]interface{}{
+			"promptTokenCount":     float64(17),
+			"candidatesTokenCount": float64(14),
+			"thoughtsTokenCount":   float64(68),
+			"totalTokenCount":      float64(99),
+		},
+	}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if estimated {
+		t.Fatal("all-thought candidate breakdown should be exact")
+	}
+	if usage.CompletionTokens != 82 || usage.TotalTokens != 99 {
+		t.Fatalf("usage = %+v, want completion=82 total=99", usage)
+	}
+	if usage.CompletionTokensDetails == nil || usage.CompletionTokensDetails.ReasoningTokens != 82 {
+		t.Fatalf("completion details = %+v, want reasoning_tokens=82", usage.CompletionTokensDetails)
+	}
+}
+
+func TestOpenAIUsageCountsBudgetExhaustedHiddenCandidatesAsReasoning(t *testing.T) {
+	result := &proxy.CallResult{
+		FinishReason: "MAX_TOKENS",
+		UsageMetadata: map[string]interface{}{
+			"promptTokenCount":     float64(22),
+			"candidatesTokenCount": float64(14),
+			"thoughtsTokenCount":   float64(82),
+			"totalTokenCount":      float64(118),
+		},
+	}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if estimated {
+		t.Fatal("reasoning-only budget exhaustion should have an exact breakdown")
+	}
+	if usage.CompletionTokens != 96 || usage.TotalTokens != 118 {
+		t.Fatalf("usage = %+v, want completion=96 total=118", usage)
+	}
+	if usage.CompletionTokensDetails == nil || usage.CompletionTokensDetails.ReasoningTokens != 96 {
+		t.Fatalf("completion details = %+v, want reasoning_tokens=96", usage.CompletionTokensDetails)
+	}
+}
+
+func TestOpenAIUsageMarksMixedThoughtCandidateBreakdownEstimated(t *testing.T) {
+	result := &proxy.CallResult{
+		TextParts: []model.TextPart{
+			{Text: "private reasoning summary", Thought: true},
+			{Text: "visible answer"},
+		},
+		UsageMetadata: map[string]interface{}{
+			"promptTokenCount":     float64(10),
+			"candidatesTokenCount": float64(12),
+			"thoughtsTokenCount":   float64(8),
+			"totalTokenCount":      float64(30),
+		},
+	}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if !estimated {
+		t.Fatal("mixed visible/thought candidate split should be marked estimated")
+	}
+	if usage.CompletionTokens != 20 || usage.TotalTokens != 30 {
+		t.Fatalf("usage = %+v, want completion=20 total=30", usage)
+	}
+	if usage.CompletionTokensDetails == nil || usage.CompletionTokensDetails.ReasoningTokens <= 8 || usage.CompletionTokensDetails.ReasoningTokens >= 20 {
+		t.Fatalf("completion details = %+v, want a bounded mixed reasoning estimate", usage.CompletionTokensDetails)
+	}
+}
+
+func TestOpenAIUsagePreservesLargerComponentBreakdown(t *testing.T) {
+	result := &proxy.CallResult{UsageMetadata: map[string]interface{}{
+		"promptTokenCount":     float64(10),
+		"candidatesTokenCount": float64(8),
+		"thoughtsTokenCount":   float64(4),
+		"totalTokenCount":      float64(15),
+	}}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if !estimated {
+		t.Fatal("impossible upstream total must be marked estimated")
+	}
+	if usage.PromptTokens != 10 || usage.CompletionTokens != 12 || usage.TotalTokens != 22 {
+		t.Fatalf("usage = %+v, want complete component total 22", usage)
+	}
+}
+
+func TestOpenAIUsageNeverReturnsTotalBelowPrompt(t *testing.T) {
+	result := &proxy.CallResult{UsageMetadata: map[string]interface{}{
+		"promptTokenCount":     float64(10),
+		"candidatesTokenCount": float64(0),
+		"thoughtsTokenCount":   float64(0),
+		"totalTokenCount":      float64(5),
+	}}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if !estimated || usage.PromptTokens != 10 || usage.CompletionTokens != 0 || usage.TotalTokens != 10 {
+		t.Fatalf("usage = %+v estimated=%v, want normalized prompt-only total", usage, estimated)
+	}
+}
+
+func TestOpenAIUsageNeverReturnsTotalBelowCompletion(t *testing.T) {
+	result := &proxy.CallResult{UsageMetadata: map[string]interface{}{
+		"candidatesTokenCount": float64(8),
+		"thoughtsTokenCount":   float64(4),
+		"totalTokenCount":      float64(5),
+	}}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if !estimated || usage.PromptTokens != 0 || usage.CompletionTokens != 12 || usage.TotalTokens != 12 {
+		t.Fatalf("usage = %+v estimated=%v, want normalized completion-only total", usage, estimated)
+	}
+}
+
+func TestOpenAIUsageClampsCachedTokensToPrompt(t *testing.T) {
+	result := &proxy.CallResult{UsageMetadata: map[string]interface{}{
+		"promptTokenCount":        float64(5),
+		"cachedContentTokenCount": float64(9),
+		"candidatesTokenCount":    float64(2),
+		"totalTokenCount":         float64(7),
+	}}
+	usage, estimated := openAIUsage(model.ChatCompletionRequest{}, result)
+	if !estimated || usage.PromptTokensDetails == nil || usage.PromptTokensDetails.CachedTokens != 5 {
+		t.Fatalf("usage = %+v estimated=%v, want cached tokens clamped to prompt", usage, estimated)
+	}
+}
+
 func TestAnthropicUsagePreservesExactZeroOutput(t *testing.T) {
 	result := &proxy.CallResult{UsageMetadata: map[string]interface{}{
 		"promptTokenCount":     float64(0),

@@ -98,15 +98,18 @@ func TestChatCompletionsConstructsStreamingLivenessProbeResponse(t *testing.T) {
 		t.Fatalf("stream is missing terminator: %s", rec.Body.String())
 	}
 	objects := decodeStreamDataObjects(t, rec.Body.String())
-	if len(objects) != 3 {
-		t.Fatalf("stream objects = %d, want content, finish, and usage chunks: %s", len(objects), rec.Body.String())
+	if len(objects) != 2 {
+		t.Fatalf("stream objects = %d, want content and final usage-bearing chunks: %s", len(objects), rec.Body.String())
 	}
 	delta := deltaFromChunk(t, objects[0])
 	if delta["role"] != "assistant" || delta["content"] != chatLivenessProbeResponse {
 		t.Fatalf("unexpected constructed stream delta: %#v", delta)
 	}
-	if usage, ok := objects[2]["usage"].(map[string]interface{}); !ok || usage["total_tokens"].(float64) <= 0 {
-		t.Fatalf("unexpected stream usage chunk: %#v", objects[2])
+	if _, ok := objects[0]["usage"]; ok {
+		t.Fatalf("content chunk must omit usage: %#v", objects[0])
+	}
+	if usage, ok := objects[1]["usage"].(map[string]interface{}); !ok || usage["total_tokens"].(float64) <= 0 {
+		t.Fatalf("unexpected final stream usage: %#v", objects[1])
 	}
 }
 
@@ -192,6 +195,21 @@ func TestWriteOpenAIStreamChunkSeparatesReasoning(t *testing.T) {
 	}
 	if got, want := deltaFromChunk(t, objects[2])["content"], "answer"; got != want {
 		t.Fatalf("third content = %v, want %q", got, want)
+	}
+	for index, object := range objects {
+		delta := deltaFromChunk(t, object)
+		if got := delta["role"]; got != "assistant" {
+			t.Fatalf("chunk %d role = %v, want assistant", index, got)
+		}
+		if _, ok := delta["reasoning_content"]; !ok {
+			t.Fatalf("chunk %d omitted reasoning_content: %#v", index, delta)
+		}
+		if toolCalls, ok := delta["tool_calls"]; !ok || toolCalls != nil {
+			t.Fatalf("chunk %d tool_calls = %#v present=%v, want explicit null", index, toolCalls, ok)
+		}
+	}
+	if got := deltaFromChunk(t, objects[2])["reasoning_content"]; got != nil {
+		t.Fatalf("content-only chunk reasoning_content = %#v, want null", got)
 	}
 }
 
@@ -492,6 +510,10 @@ func TestStreamResponseKeepsToolCallsAcrossTrailingFinishMetadata(t *testing.T) 
 	if len(objects) == 0 {
 		t.Fatal("stream should contain response chunks")
 	}
+	toolCalls, ok := deltaFromChunk(t, objects[0])["tool_calls"].([]interface{})
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("tool call delta = %#v, want one actual tool call", deltaFromChunk(t, objects[0])["tool_calls"])
+	}
 	choices, ok := objects[len(objects)-1]["choices"].([]interface{})
 	if !ok || len(choices) != 1 {
 		t.Fatalf("final chunk choices = %v, want one choice", objects[len(objects)-1]["choices"])
@@ -503,16 +525,133 @@ func TestStreamResponseKeepsToolCallsAcrossTrailingFinishMetadata(t *testing.T) 
 	if got, want := choice["finish_reason"], "tool_calls"; got != want {
 		t.Fatalf("final finish_reason = %v, want %q; body=%s", got, want, rec.Body.String())
 	}
+	if _, ok := choice["native_finish_reason"]; ok {
+		t.Fatalf("final choice must omit native_finish_reason: %#v", choice)
+	}
 }
 
-func TestOpenAIFinishReasonDoesNotInferContentFilter(t *testing.T) {
+func TestOpenAIFinishReasonMapsSafetyToContentFilter(t *testing.T) {
 	result := &proxy.CallResult{
 		FinishReason:   "SAFETY",
 		PromptFeedback: map[string]interface{}{"blockReason": "SAFETY", "blockReasonMessage": "blocked"},
 	}
+	if got := openAIFinishReason(result); got != "content_filter" {
+		t.Fatalf("finish reason = %q, want content_filter", got)
+	}
+}
+
+func TestOpenAIFinishReasonIgnoresUnspecifiedBlockReason(t *testing.T) {
+	result := &proxy.CallResult{PromptFeedback: map[string]interface{}{"blockReason": "BLOCKED_REASON_UNSPECIFIED"}}
 	if got := openAIFinishReason(result); got != "stop" {
 		t.Fatalf("finish reason = %q, want stop", got)
 	}
+}
+
+func TestOpenAIStreamProtocolOptionsAndStableMetadata(t *testing.T) {
+	tests := []struct {
+		name            string
+		options         *model.ChatStreamOptions
+		wantUsage       bool
+		wantObfuscation bool
+	}{
+		{name: "defaults", wantObfuscation: true},
+		{name: "usage", options: &model.ChatStreamOptions{IncludeUsage: true}, wantUsage: true, wantObfuscation: true},
+		{name: "obfuscation disabled", options: &model.ChatStreamOptions{IncludeObfuscation: boolPointer(false)}},
+		{name: "obfuscation enabled", options: &model.ChatStreamOptions{IncludeObfuscation: boolPointer(true)}, wantObfuscation: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqModel := model.ChatCompletionRequest{
+				Model:         "gemini-test",
+				Messages:      []model.ChatMessage{{Role: "user", Content: "hello"}},
+				Stream:        true,
+				StreamOptions: tt.options,
+			}
+			rec := httptest.NewRecorder()
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			streamResponseForRequest(rec, httpReq, reqModel, func(_ context.Context, onChunk func(*proxy.CallResult) error) error {
+				if err := onChunk(&proxy.CallResult{TextParts: []model.TextPart{{Text: "hello"}}}); err != nil {
+					return err
+				}
+				return onChunk(&proxy.CallResult{FinishReason: "STOP", UsageMetadata: map[string]interface{}{
+					"promptTokenCount": float64(2), "candidatesTokenCount": float64(1), "totalTokenCount": float64(3),
+				}})
+			})
+
+			objects := decodeStreamDataObjects(t, rec.Body.String())
+			if len(objects) != 2 {
+				t.Fatalf("stream chunks = %d, want 2: %s", len(objects), rec.Body.String())
+			}
+			firstID, firstCreated := objects[0]["id"], objects[0]["created"]
+			for index, object := range objects {
+				if object["id"] != firstID || object["created"] != firstCreated {
+					t.Fatalf("chunk %d metadata changed: first=%#v current=%#v", index, objects[0], object)
+				}
+				_, hasObfuscation := object["obfuscation"].(string)
+				if hasObfuscation != tt.wantObfuscation {
+					t.Fatalf("chunk %d obfuscation presence = %v, want %v: %#v", index, hasObfuscation, tt.wantObfuscation, object)
+				}
+				choices, ok := object["choices"].([]interface{})
+				if !ok || len(choices) != 1 {
+					t.Fatalf("chunk %d choices = %#v, want one choice", index, object["choices"])
+				}
+				choice := choices[0].(map[string]interface{})
+				if _, ok := choice["native_finish_reason"]; ok {
+					t.Fatalf("chunk %d unexpectedly included native_finish_reason: %#v", index, choice)
+				}
+				delta := choice["delta"].(map[string]interface{})
+				if delta["role"] != "assistant" {
+					t.Fatalf("chunk %d role = %#v, want assistant", index, delta["role"])
+				}
+				if _, ok := delta["reasoning_content"]; !ok {
+					t.Fatalf("chunk %d omitted reasoning_content: %#v", index, delta)
+				}
+				if _, ok := delta["tool_calls"]; !ok {
+					t.Fatalf("chunk %d omitted tool_calls: %#v", index, delta)
+				}
+			}
+			if _, hasUsage := objects[0]["usage"]; hasUsage {
+				t.Fatalf("intermediate chunk must omit usage: %#v", objects[0])
+			}
+			usage, hasUsage := objects[1]["usage"]
+			if hasUsage != tt.wantUsage {
+				t.Fatalf("final usage presence = %v, want %v: %#v", hasUsage, tt.wantUsage, objects[1])
+			}
+			if tt.wantUsage {
+				usageObject, ok := usage.(map[string]interface{})
+				if !ok || usageObject["prompt_tokens"] != float64(2) || usageObject["completion_tokens"] != float64(1) || usageObject["total_tokens"] != float64(3) {
+					t.Fatalf("final usage = %#v, want complete 2/1/3 counters", usage)
+				}
+			}
+			firstChoice := objects[0]["choices"].([]interface{})[0].(map[string]interface{})
+			if firstChoice["finish_reason"] != nil {
+				t.Fatalf("intermediate finish_reason = %#v, want null", firstChoice["finish_reason"])
+			}
+			finalChoice := objects[1]["choices"].([]interface{})[0].(map[string]interface{})
+			if finalChoice["finish_reason"] != "stop" {
+				t.Fatalf("final finish_reason = %#v, want stop", finalChoice["finish_reason"])
+			}
+			if !strings.HasSuffix(rec.Body.String(), "data: [DONE]\n\n") {
+				t.Fatalf("stream does not end in [DONE]: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestValidateOpenAIRequestRejectsStreamOptionsWithoutStreaming(t *testing.T) {
+	message := validateOpenAIRequest(model.ChatCompletionRequest{
+		Model:         "gemini-test",
+		Messages:      []model.ChatMessage{{Role: "user", Content: "hello"}},
+		StreamOptions: &model.ChatStreamOptions{IncludeUsage: true},
+	})
+	if message != "stream_options may only be set when stream is true" {
+		t.Fatalf("validation message = %q", message)
+	}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func TestStreamResponseIgnoresUnspecifiedPromptFeedback(t *testing.T) {

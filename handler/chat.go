@@ -193,6 +193,9 @@ func validateOpenAIRequest(req model.ChatCompletionRequest) string {
 	if req.Stream && req.N != nil && *req.N > 1 {
 		return "n greater than 1 is not supported for streaming"
 	}
+	if !req.Stream && req.StreamOptions != nil {
+		return "stream_options may only be set when stream is true"
+	}
 	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
 		return "temperature must be between 0 and 2"
 	}
@@ -523,7 +526,10 @@ func streamResponseForRequestWithProxy(
 	modelName := req.Model
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-	streamState := &openAIStreamState{}
+	streamState := &openAIStreamState{
+		created:            time.Now().Unix(),
+		includeObfuscation: openAIStreamObfuscationEnabled(req.StreamOptions),
+	}
 	aggregate := &proxy.CallResult{}
 	usageRevision := &streamUsageRevision{}
 	committed := false
@@ -587,7 +593,7 @@ func streamResponseForRequestWithProxy(
 	// Vertex finishReason is completion metadata and may arrive before later
 	// content chunks, so it must never end the downstream stream by itself.
 	finishReason := openAIFinishReason(aggregate)
-	if err := writeOpenAIStreamEnd(w, id, modelName, finishReason, usage); err != nil {
+	if err := writeOpenAIStreamEnd(w, id, modelName, finishReason, usage, streamState); err != nil {
 		if requestContextCanceled(ctx, err) {
 			log.Debug().Err(err).Str("model", modelName).Msg("OpenAI stream client disconnected")
 			return
@@ -631,18 +637,19 @@ func accumulateCallResult(dst, src *proxy.CallResult) {
 }
 
 func writeOpenAIStreamChunk(w http.ResponseWriter, id, modelName string, result *proxy.CallResult, streamState *openAIStreamState) error {
-	chunk := model.ChatCompletionResponse{
+	chunk := model.ChatCompletionChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
+		Created: openAIStreamCreated(streamState),
 		Model:   modelName,
-		Choices: []model.ChatChoice{
+		Choices: []model.ChatCompletionChunkChoice{
 			{
 				Index: 0,
 				Delta: buildOpenAIDelta(result, streamState),
 			},
 		},
 	}
+	applyOpenAIStreamChunkOptions(&chunk, streamState)
 
 	chunkData, _ := sonic.Marshal(chunk)
 	if _, err := io.WriteString(w, "data: "); err != nil {
@@ -657,20 +664,24 @@ func writeOpenAIStreamChunk(w http.ResponseWriter, id, modelName string, result 
 	return flushResponse(w)
 }
 
-func writeOpenAIStreamEnd(w http.ResponseWriter, id, modelName, finishReason string, usage *model.Usage) error {
-	endChunk := model.ChatCompletionResponse{
+func writeOpenAIStreamEnd(w http.ResponseWriter, id, modelName, finishReason string, usage *model.Usage, streamState *openAIStreamState) error {
+	endChunk := model.ChatCompletionChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
+		Created: openAIStreamCreated(streamState),
 		Model:   modelName,
-		Choices: []model.ChatChoice{
+		Choices: []model.ChatCompletionChunkChoice{
 			{
-				Index:        0,
-				Delta:        &model.ChatMessage{},
+				Index: 0,
+				Delta: &model.ChatCompletionDelta{
+					Role: "assistant",
+				},
 				FinishReason: &finishReason,
 			},
 		},
+		Usage: usage,
 	}
+	applyOpenAIStreamChunkOptions(&endChunk, streamState)
 	endData, _ := sonic.Marshal(endChunk)
 	if _, err := io.WriteString(w, "data: "); err != nil {
 		return err
@@ -680,26 +691,6 @@ func writeOpenAIStreamEnd(w http.ResponseWriter, id, modelName, finishReason str
 	}
 	if _, err := io.WriteString(w, "\n\n"); err != nil {
 		return err
-	}
-	if usage != nil {
-		usageChunk := model.ChatCompletionResponse{
-			ID:      id,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   modelName,
-			Choices: []model.ChatChoice{},
-			Usage:   usage,
-		}
-		usageData, _ := sonic.Marshal(usageChunk)
-		if _, err := io.WriteString(w, "data: "); err != nil {
-			return err
-		}
-		if _, err := w.Write(usageData); err != nil {
-			return err
-		}
-		if _, err := io.WriteString(w, "\n\n"); err != nil {
-			return err
-		}
 	}
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 		return err
@@ -743,21 +734,20 @@ func buildOpenAIMessage(result *proxy.CallResult) *model.ChatMessage {
 	return msg
 }
 
-func buildOpenAIDelta(result *proxy.CallResult, streamState *openAIStreamState) *model.ChatMessage {
+func buildOpenAIDelta(result *proxy.CallResult, streamState *openAIStreamState) *model.ChatCompletionDelta {
 	content, reasoning := buildStreamResponseContent(result)
-	role := ""
-	if streamState != nil && !streamState.hasIndexedContent {
-		streamState.hasIndexedContent = true
-		role = "assistant"
+	var reasoningContent *string
+	if reasoning != "" {
+		reasoningContent = &reasoning
 	}
 	var toolCalls []model.ChatToolCall
 	if result != nil {
 		toolCalls = buildOpenAIToolCalls(result.FunctionCalls, true)
 	}
-	msg := &model.ChatMessage{
-		Role:             role,
+	msg := &model.ChatCompletionDelta{
+		Role:             "assistant",
 		Content:          content,
-		ReasoningContent: reasoning,
+		ReasoningContent: reasoningContent,
 		ToolCalls:        toolCalls,
 	}
 	if result != nil && result.GroundingMetadata != nil {
@@ -823,8 +813,40 @@ func groundingChunkLink(chunk model.GroundingChunk) (string, string) {
 }
 
 type openAIStreamState struct {
-	hasIndexedContent bool
-	emittedGrounding  bool
+	emittedGrounding   bool
+	created            int64
+	includeObfuscation bool
+}
+
+func openAIStreamObfuscationEnabled(options *model.ChatStreamOptions) bool {
+	return options == nil || options.IncludeObfuscation == nil || *options.IncludeObfuscation
+}
+
+func openAIStreamCreated(state *openAIStreamState) int64 {
+	if state == nil {
+		return time.Now().Unix()
+	}
+	if state.created == 0 {
+		state.created = time.Now().Unix()
+	}
+	return state.created
+}
+
+func applyOpenAIStreamChunkOptions(chunk *model.ChatCompletionChunk, state *openAIStreamState) {
+	if chunk == nil || state == nil {
+		return
+	}
+	if state.includeObfuscation {
+		chunk.Obfuscation = newOpenAIStreamObfuscation()
+	}
+}
+
+func newOpenAIStreamObfuscation() string {
+	data := make([]byte, 12)
+	if _, err := rand.Read(data); err == nil {
+		return base64.RawURLEncoding.EncodeToString(data)
+	}
+	return fmt.Sprintf("%x", time.Now().UnixNano())
 }
 
 func generateOpenAIToolCallID(index int) string {
@@ -873,9 +895,23 @@ func openAIFinishReason(result *proxy.CallResult) string {
 	switch strings.ToUpper(result.FinishReason) {
 	case "MAX_TOKENS":
 		return "length"
+	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "MODEL_ARMOR":
+		return "content_filter"
 	default:
+		if hasBlockedOpenAIPromptFeedback(result.PromptFeedback) {
+			return "content_filter"
+		}
 		return "stop"
 	}
+}
+
+func hasBlockedOpenAIPromptFeedback(feedback map[string]interface{}) bool {
+	if len(feedback) == 0 {
+		return false
+	}
+	reason, _ := feedback["blockReason"].(string)
+	reason = strings.ToUpper(strings.TrimSpace(reason))
+	return reason != "" && reason != "BLOCKED_REASON_UNSPECIFIED" && reason != "BLOCK_REASON_UNSPECIFIED"
 }
 
 const openAIToolSignatureMarker = "__vertex_sig_"

@@ -23,7 +23,8 @@ type ChatCompletionRequest struct {
 }
 
 type ChatStreamOptions struct {
-	IncludeUsage bool `json:"include_usage,omitempty"`
+	IncludeUsage       bool  `json:"include_usage,omitempty"`
+	IncludeObfuscation *bool `json:"include_obfuscation,omitempty"`
 }
 
 type ChatMessage struct {
@@ -56,13 +57,39 @@ type ChatCompletionResponse struct {
 	Created int64        `json:"created"`
 	Model   string       `json:"model"`
 	Choices []ChatChoice `json:"choices"`
-	Usage   *Usage       `json:"usage"`
+	Usage   *Usage       `json:"usage,omitempty"`
+}
+
+// ChatCompletionChunk is kept separate from ChatCompletionResponse so the
+// streaming compatibility shape can expose explicit nullable delta fields and
+// attach usage to the final choice-bearing chunk.
+type ChatCompletionChunk struct {
+	ID          string                      `json:"id"`
+	Object      string                      `json:"object"`
+	Created     int64                       `json:"created"`
+	Model       string                      `json:"model"`
+	Choices     []ChatCompletionChunkChoice `json:"choices"`
+	Usage       *Usage                      `json:"usage,omitempty"`
+	Obfuscation string                      `json:"obfuscation,omitempty"`
+}
+
+type ChatCompletionChunkChoice struct {
+	Index        int                  `json:"index"`
+	Delta        *ChatCompletionDelta `json:"delta"`
+	FinishReason *string              `json:"finish_reason"`
+}
+
+type ChatCompletionDelta struct {
+	Role             string           `json:"role"`
+	Content          interface{}      `json:"content"`
+	ReasoningContent *string          `json:"reasoning_content"`
+	ToolCalls        []ChatToolCall   `json:"tool_calls"`
+	Annotations      []ChatAnnotation `json:"annotations,omitempty"`
 }
 
 type ChatChoice struct {
 	Index        int          `json:"index"`
 	Message      *ChatMessage `json:"message,omitempty"`
-	Delta        *ChatMessage `json:"delta,omitempty"`
 	FinishReason *string      `json:"finish_reason"`
 }
 
