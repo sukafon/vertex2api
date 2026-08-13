@@ -50,6 +50,21 @@ func TestAuthHealthIsPublicButAPIRoutesFailClosed(t *testing.T) {
 	}
 }
 
+func TestAuthLeavesStatsKeyRoutesToTheirHandlers(t *testing.T) {
+	cfg := &config.Config{APIKeys: []string{"api-secret"}}
+	handler := Auth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	for _, path := range []string{"/v1/stats", "/v1/models/refresh"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("%s status = %d, want 204", path, rec.Code)
+		}
+	}
+}
+
 func TestAuthUsesNativeGeminiEnvelopeForV1Route(t *testing.T) {
 	cfg := &config.Config{APIKeys: []string{"secret"}}
 	handler := Auth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

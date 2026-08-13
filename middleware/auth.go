@@ -17,7 +17,7 @@ import (
 func Auth(cfg *config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if (len(cfg.APIKeys) == 0 && cfg.AllowUnauthenticated) || r.URL.Path == "/v1/stats" || r.URL.Path == "/health" {
+			if (len(cfg.APIKeys) == 0 && cfg.AllowUnauthenticated) || isPublicOrStatsKeyRoute(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -36,6 +36,10 @@ func Auth(cfg *config.Config) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func isPublicOrStatsKeyRoute(path string) bool {
+	return path == "/health" || path == "/v1/stats" || path == "/v1/models/refresh"
 }
 
 func extractKey(r *http.Request) string {

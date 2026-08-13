@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,7 @@ import (
 
 func TestApplicationHealthAuthAndLocalCountTokens(t *testing.T) {
 	cfg := &config.Config{APIKeys: []string{"secret"}}
-	app := newApplication(cfg, nil)
+	app := newApplication(cfg, nil, nil)
 
 	health := httptest.NewRecorder()
 	app.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -64,7 +65,7 @@ func TestApplicationHealthAuthAndLocalCountTokens(t *testing.T) {
 
 func TestApplicationCORSIsOptInAndOriginBound(t *testing.T) {
 	cfg := &config.Config{APIKeys: []string{"secret"}, CORSAllowOrigin: "https://app.example"}
-	app := newApplication(cfg, nil)
+	app := newApplication(cfg, nil, nil)
 
 	allowedRequest := httptest.NewRequest(http.MethodOptions, "/v1/models", nil)
 	allowedRequest.Header.Set("Origin", "https://app.example")
@@ -85,7 +86,7 @@ func TestApplicationCORSIsOptInAndOriginBound(t *testing.T) {
 
 func TestApplicationRejectsTraversalBeforeAuthentication(t *testing.T) {
 	cfg := &config.Config{APIKeys: []string{"1234567890123456"}}
-	app := newApplication(cfg, nil)
+	app := newApplication(cfg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	req.URL.Path = "/v1/models/../../health"
@@ -100,7 +101,7 @@ func TestApplicationRejectsTraversalBeforeAuthentication(t *testing.T) {
 
 func TestApplicationRegistersResponsesRoutes(t *testing.T) {
 	cfg := &config.Config{APIKeys: []string{"1234567890123456"}, AllowCustomModelNames: true}
-	app := newApplication(cfg, nil)
+	app := newApplication(cfg, nil, nil)
 
 	for _, path := range []string{"/v1/responses", "/v1/responses/compact"} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"custom-model"}`))
@@ -114,5 +115,39 @@ func TestApplicationRegistersResponsesRoutes(t *testing.T) {
 		if !strings.Contains(recorder.Body.String(), "input is required") {
 			t.Fatalf("%s did not reach Responses handler: %s", path, recorder.Body.String())
 		}
+	}
+}
+
+func TestApplicationModelRefreshUsesStatsKey(t *testing.T) {
+	cfg := &config.Config{
+		APIKeys:  []string{"api-secret"},
+		StatsKey: "stats-secret",
+	}
+	called := 0
+	app := newApplication(cfg, nil, func(context.Context) (int, error) {
+		called++
+		return 3, nil
+	})
+
+	apiKeyRequest := httptest.NewRequest(http.MethodPost, "/v1/models/refresh", nil)
+	apiKeyRequest.Header.Set("Authorization", "Bearer api-secret")
+	apiKeyResponse := httptest.NewRecorder()
+	app.ServeHTTP(apiKeyResponse, apiKeyRequest)
+	if apiKeyResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("API_KEY status = %d, want 401: %s", apiKeyResponse.Code, apiKeyResponse.Body.String())
+	}
+	if called != 0 {
+		t.Fatalf("refresher called %d times with API_KEY, want 0", called)
+	}
+
+	statsKeyRequest := httptest.NewRequest(http.MethodPost, "/v1/models/refresh", nil)
+	statsKeyRequest.Header.Set("Authorization", "Bearer stats-secret")
+	statsKeyResponse := httptest.NewRecorder()
+	app.ServeHTTP(statsKeyResponse, statsKeyRequest)
+	if statsKeyResponse.Code != http.StatusOK {
+		t.Fatalf("STATS_KEY status = %d, want 200: %s", statsKeyResponse.Code, statsKeyResponse.Body.String())
+	}
+	if called != 1 {
+		t.Fatalf("refresher called %d times with STATS_KEY, want 1", called)
 	}
 }

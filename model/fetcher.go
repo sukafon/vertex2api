@@ -49,7 +49,7 @@ func FetchUpstreamModels(ctx context.Context, httpClient *client.HTTPClient, bas
 		QuerySignature: modelConfigsQuerySignature,
 		OperationName:  modelConfigsOperationName,
 		Variables: ModelConfigsVariables{
-			LocationID:    "us-central1",
+			LocationID:    "global",
 			LanguageTag:   "zh_CN",
 			ProjectNumber: "",
 		},
@@ -93,13 +93,13 @@ func UpdateCatalogFromUpstream(ctx context.Context, httpClient *client.HTTPClien
 	}
 
 	if len(models) == 0 {
-		log.Warn().Msg("Auto-fetched model list from upstream is empty, catalog not updated")
+		log.Warn().Msg("Fetched model list from upstream is empty, catalog not updated")
 		return models, nil
 	}
 
 	newCatalog := buildModelCatalog(models)
 	SetCatalog(newCatalog)
-	log.Info().Int("count", len(models)).Msg("Successfully auto-fetched and updated model catalog in memory")
+	log.Info().Int("count", len(models)).Msg("Successfully fetched and updated model catalog in memory")
 	return models, nil
 }
 

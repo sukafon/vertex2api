@@ -140,7 +140,7 @@ curl http://127.0.0.1:8080/v1/messages \
 | `GEMINI_STRICT_ALT_SSE` | `false` | 是否严格要求 Gemini `streamGenerateContent` 使用 `alt=sse` 才返回 SSE；开启后缺少或使用其他 `alt` 值会等待完成并返回单个完整 JSON 响应对象 |
 | `REJECT_CHAT_LIVENESS_PROBES` | `false` | 是否拒绝仅包含单条 `"hi"` 用户消息的 OpenAI Chat 请求；开启后应使用 `GET /health` 验活 |
 | `RESPOND_CHAT_LIVENESS_PROBES` | `false` | 是否对上述验活请求在本地构造协议合法的正常响应并跳过上游；与拒绝开关同时开启时本项优先 |
-| `STATS_KEY` | 无 | `/v1/stats` 独立密钥；留空时该接口不可用 |
+| `STATS_KEY` | 无 | `/v1/stats` 和 `POST /v1/models/refresh` 的独立密钥；留空时这两个接口不可用 |
 | `HOST` | `0.0.0.0` | 服务监听地址，例如 `0.0.0.0` 或 `127.0.0.1` |
 | `PORT` | `8080` | 监听端口 |
 | `VERTEX_BASE_URL` | `https://cloudconsole-pa.clients6.google.com` | 匿名 Vertex GraphQL 上游基址 |
@@ -180,6 +180,15 @@ docker cp vertex2api:/app/code3_request_bodies.log ~/vertex2api/code3_request_bo
 ## 模型目录
 
 项目内置一份小型回退目录，因此发布包不需要提交动态生成的 `model.json`。启用 `AUTO_FETCH_MODELS=true` 后，程序会在启动时和 Cron 触发时从相同的 Vertex GraphQL 链路刷新内存目录；拉取失败时保留最后一份可用目录，不写入磁盘。
+
+也可以随时使用 `STATS_KEY` 手动刷新；该操作不受 `AUTO_FETCH_MODELS` 开关影响：
+
+```bash
+curl -X POST 'http://127.0.0.1:8080/v1/models/refresh' \
+  -H 'Authorization: Bearer your-stats-key'
+```
+
+刷新成功返回更新后的 `model_count`；上游失败或返回空目录时保留当前内存目录。
 
 ## Docker
 

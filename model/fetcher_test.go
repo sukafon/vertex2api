@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -205,6 +206,13 @@ func TestUpdateCatalogFromUpstream(t *testing.T) {
 		}
 		if got := r.URL.Query().Get("key"); got != "test-vertex-key" {
 			t.Errorf("Vertex API key = %q, want test-vertex-key", got)
+		}
+		var requestBody ModelConfigsRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Fatalf("decode model config request: %v", err)
+		}
+		if got := requestBody.Variables.LocationID; got != "global" {
+			t.Errorf("locationId = %q, want global", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

@@ -80,7 +80,11 @@ func run() error {
 	defer stop()
 	model.StartAutoFetcher(ctx, httpClient, cfg)
 
-	app := newApplication(cfg, vertexProxy)
+	modelRefresher := func(ctx context.Context) (int, error) {
+		models, err := model.UpdateCatalogFromUpstream(ctx, httpClient, cfg.VertexBaseURL, cfg.GraphQLAPIKey)
+		return len(models), err
+	}
+	app := newApplication(cfg, vertexProxy, modelRefresher)
 	addr := net.JoinHostPort(cfg.Host, cfg.Port)
 	server := &http.Server{
 		Addr:              addr,
@@ -115,7 +119,7 @@ func run() error {
 	}
 }
 
-func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Handler {
+func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy, modelRefresher handler.ModelCatalogRefreshFunc) http.Handler {
 	mux := http.NewServeMux()
 	responsesAPI := handler.NewResponsesAPI(vertexProxy, cfg.AllowCustomModelNames, strings.Join(cfg.APIKeys, "\x00"))
 	mux.Handle("POST /v1/messages", handler.AnthropicMessages(vertexProxy, cfg.AllowCustomModelNames))
@@ -127,6 +131,7 @@ func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Han
 	mux.Handle("POST /v1/images/edits", handler.ImageEdits(vertexProxy, cfg.AllowCustomModelNames))
 	mux.Handle("GET /v1/models", handler.ModelsList())
 	mux.Handle("GET /v1/models/{modelID}", handler.RetrieveModel())
+	mux.Handle("POST /v1/models/refresh", handler.RefreshModels(cfg, modelRefresher))
 	mux.Handle("GET /v1/stats", handler.Stats(cfg))
 
 	geminiHandler := handler.GeminiGenerate(vertexProxy, cfg.AllowCustomModelNames, cfg.GeminiStrictAltSSE)
@@ -153,6 +158,7 @@ func newApplication(cfg *config.Config, vertexProxy *proxy.VertexProxy) http.Han
 				"POST /v1/images/generations",
 				"POST /v1/images/edits",
 				"GET  /v1/models",
+				"POST /v1/models/refresh",
 				"POST /v1beta1/models/{model}:generateContent",
 				"POST /v1beta1/models/{model}:streamGenerateContent",
 				"POST /v1beta1/models/{model}:countTokens",
