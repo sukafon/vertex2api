@@ -453,11 +453,6 @@ func estimateCompletionTokenBreakdown(result *proxy.CallResult) (candidateTokens
 	return candidateTokens, reasoningTokens
 }
 
-func estimateReasoningTokens(result *proxy.CallResult) int {
-	_, reasoningTokens := estimateCompletionTokenBreakdown(result)
-	return reasoningTokens
-}
-
 func estimateVertexPartTokens(part model.VertexPart) (candidateTokens, reasoningTokens int) {
 	if part.Text != "" {
 		tokens := estimateTextTokens(part.Text)

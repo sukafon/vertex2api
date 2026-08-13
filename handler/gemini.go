@@ -397,10 +397,6 @@ func isKnownGeminiHarmProbability(probability string) bool {
 	}
 }
 
-func buildGeminiCandidate(result *proxy.CallResult, defaultStop bool) map[string]interface{} {
-	return buildGeminiCandidateWithThoughts(result, defaultStop, true)
-}
-
 func buildGeminiCandidateWithThoughts(result *proxy.CallResult, defaultStop, includeThoughts bool) map[string]interface{} {
 	parts := buildCanonicalGeminiPartsWithThoughts(result, includeThoughts)
 	if defaultStop {
@@ -428,10 +424,6 @@ func buildGeminiCandidateWithThoughts(result *proxy.CallResult, defaultStop, inc
 	}
 
 	return candidate
-}
-
-func buildCanonicalGeminiParts(result *proxy.CallResult) []map[string]interface{} {
-	return buildCanonicalGeminiPartsWithThoughts(result, true)
 }
 
 func buildCanonicalGeminiPartsWithThoughts(result *proxy.CallResult, includeThoughts bool) []map[string]interface{} {
