@@ -28,7 +28,7 @@ import (
 const maxRequestBodyBytes = 32 * 1024 * 1024
 
 var (
-	version   = "1.0.8"
+	version   = "1.0.9"
 	commit    = "unknown"
 	buildDate = "unknown"
 )
