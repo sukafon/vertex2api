@@ -2471,7 +2471,7 @@ func TestTrimTrailingEmptyModelTurns(t *testing.T) {
 		t.Fatalf("empty model turn was not trimmed, got len=%d, lastRole=%v", len(res1), res1[len(res1)-1]["role"])
 	}
 
-	// Other Gemini models preserve a non-empty model prefill as before.
+	// Older Gemini models preserve a non-empty model prefill as before.
 	textModelEnd := []map[string]interface{}{
 		{"role": "user", "parts": []interface{}{map[string]interface{}{"text": "hi"}}},
 		{"role": "model", "parts": []interface{}{map[string]interface{}{"text": "I am model"}}},
@@ -2491,7 +2491,7 @@ func TestTrimTrailingEmptyModelTurns(t *testing.T) {
 		t.Fatalf("gemini-3.5 model prefill was modified, got len=%d, lastRole=%v", len(res35), res35[len(res35)-1]["role"])
 	}
 
-	for _, modelName := range []string{"gemini-3.6-flash"} {
+	for _, modelName := range []string{"gemini-3.5-flash-lite", "gemini-3.5-flash-lite-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-4-pro"} {
 		res, err := normalizeContents(modelName, textModelEnd)
 		if err != nil {
 			t.Fatalf("normalizeContents(%s) error: %v", modelName, err)
@@ -2530,6 +2530,54 @@ func TestTrimTrailingEmptyModelTurns(t *testing.T) {
 	longText := strings.Repeat("中", 1100)
 	if got := config.UpstreamLogValue(longText, false, 1024); len([]rune(got)) != 1027 {
 		t.Fatalf("truncated model turn text rune length = %d, want 1027 including ellipsis", len([]rune(got)))
+	}
+}
+
+func TestRequiresTrailingUserTurnUsesGeminiVersion(t *testing.T) {
+	tests := []struct {
+		modelName string
+		want      bool
+	}{
+		{modelName: "gemini-2.5-flash", want: false},
+		{modelName: "gemini-3-pro", want: false},
+		{modelName: "gemini-3.5-flash", want: false},
+		{modelName: "gemini-3.5-flash-lite", want: true},
+		{modelName: "gemini-3.5-flash-lite-preview", want: true},
+		{modelName: "gemini-3.6-flash", want: true},
+		{modelName: " GEMINI-3.7-FLASH ", want: true},
+		{modelName: "gemini-3.10-pro", want: true},
+		{modelName: "gemini-4-pro", want: true},
+		{modelName: "custom-gemini-3.7", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.modelName, func(t *testing.T) {
+			if got := requiresTrailingUserTurn(tt.modelName); got != tt.want {
+				t.Fatalf("requiresTrailingUserTurn(%q) = %v, want %v", tt.modelName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildVertexBodyDropsGemini37TrailingModelTurn(t *testing.T) {
+	contents := []map[string]interface{}{
+		{"role": "user", "parts": []map[string]interface{}{{"text": "[Start a new chat]"}}},
+		{"role": "model", "parts": []map[string]interface{}{{"text": "first answer"}}},
+		{"role": "user", "parts": []map[string]interface{}{{"text": "follow-up"}}},
+		{"role": "model", "parts": []map[string]interface{}{{"text": "trailing answer"}}},
+	}
+
+	body, err := BuildVertexBody("gemini-3.7-flash", contents, nil, nil, nil, "token")
+	if err != nil {
+		t.Fatalf("BuildVertexBody returned error: %v", err)
+	}
+	got := variablesFromBody(t, body)["contents"].([]interface{})
+	if len(got) != 3 {
+		t.Fatalf("contents length = %d, want 3: %#v", len(got), got)
+	}
+	last := got[len(got)-1].(map[string]interface{})
+	if last["role"] != "user" || contentTurnText(last) != "follow-up" {
+		t.Fatalf("last content = %#v, want final user turn", last)
 	}
 }
 

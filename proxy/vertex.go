@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -604,7 +605,7 @@ func normalizeContents(modelName string, contents []map[string]interface{}) ([]m
 		normalized = trimTrailingEmptyTurns(normalized)
 		normalized = dropTrailingModelPrefill(modelName, normalized)
 		if len(normalized) == 0 {
-			return nil, errors.New("gemini 3.6 requests must contain a user turn")
+			return nil, errors.New("this model requires at least one user turn")
 		}
 	}
 	return normalized, nil
@@ -890,7 +891,30 @@ func contentTurnHasContent(content map[string]interface{}) bool {
 
 func requiresTrailingUserTurn(modelName string) bool {
 	modelName = strings.ToLower(strings.TrimSpace(modelName))
-	return strings.HasPrefix(modelName, "gemini-3.6")
+	const gemini35FlashLite = "gemini-3.5-flash-lite"
+	if modelName == gemini35FlashLite || strings.HasPrefix(modelName, gemini35FlashLite+"-") {
+		return true
+	}
+
+	const prefix = "gemini-"
+	if !strings.HasPrefix(modelName, prefix) {
+		return false
+	}
+
+	version := strings.SplitN(strings.TrimPrefix(modelName, prefix), "-", 2)[0]
+	components := strings.Split(version, ".")
+	major, err := strconv.Atoi(components[0])
+	if err != nil {
+		return false
+	}
+	if major > 3 {
+		return true
+	}
+	if major < 3 || len(components) < 2 {
+		return false
+	}
+	minor, err := strconv.Atoi(components[1])
+	return err == nil && minor >= 6
 }
 
 func requiresFunctionCallID(modelName string) bool {
@@ -898,8 +922,8 @@ func requiresFunctionCallID(modelName string) bool {
 	return strings.HasPrefix(modelName, "gemini-3.6")
 }
 
-// dropTrailingModelPrefill adapts Gemini 3.6's generateContent contract,
-// which disallows prefilled model turns. Other models are unchanged.
+// dropTrailingModelPrefill adapts generateContent models that disallow
+// prefilled model turns. Older models are left unchanged by the caller.
 func dropTrailingModelPrefill(modelName string, contents []map[string]interface{}) []map[string]interface{} {
 	for len(contents) > 0 {
 		last := contents[len(contents)-1]
@@ -917,7 +941,7 @@ func dropTrailingModelPrefill(modelName string, contents []map[string]interface{
 			Str("model", modelName).
 			Str("model_text", config.UpstreamLogValue(contentTurnText(last), false, 1024)).
 			Str("user_text", config.UpstreamLogValue(userText, false, 1024)).
-			Msg("Removed trailing Gemini 3.6 model turn before upstream request")
+			Msg("Removed trailing model turn before upstream request")
 		contents = contents[:len(contents)-1]
 	}
 	return contents
