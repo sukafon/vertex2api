@@ -893,6 +893,38 @@ func TestAnthropicOutputEffortMapsToVertexThinking(t *testing.T) {
 	}
 }
 
+func TestAnthropicDoesNotGuessMissingCatalogThinkingLevel(t *testing.T) {
+	maxTokens := 64
+	config := buildAnthropicGenerationConfig(model.AnthropicMessageRequest{
+		Model:     "gemini-3-unknown-catalog-capability",
+		MaxTokens: &maxTokens,
+		Messages:  []model.AnthropicInputMessage{{Role: "user", Content: "hello"}},
+	})
+	if thinking, exists := config["thinkingConfig"]; exists {
+		t.Fatalf("thinkingConfig = %#v, want absent without upstream capability metadata", thinking)
+	}
+}
+
+func TestAnthropicExplicitThinkingOverridesGemini3Default(t *testing.T) {
+	maxTokens := 4096
+	config := buildAnthropicGenerationConfig(model.AnthropicMessageRequest{
+		Model:     "gemini-3.7-flash",
+		MaxTokens: &maxTokens,
+		Messages:  []model.AnthropicInputMessage{{Role: "user", Content: "think"}},
+		Thinking:  map[string]interface{}{"type": "enabled", "budget_tokens": 1024},
+	})
+	thinking := config["thinkingConfig"].(map[string]interface{})
+	if got := thinking["thinkingBudget"]; got != 1024 {
+		t.Fatalf("thinkingBudget = %v, want 1024", got)
+	}
+	if got := thinking["includeThoughts"]; got != true {
+		t.Fatalf("includeThoughts = %v, want true", got)
+	}
+	if _, exists := thinking["thinkingLevel"]; exists {
+		t.Fatalf("explicit thinking was overwritten by default: %#v", thinking)
+	}
+}
+
 func TestAnthropicDocumentsAndRemoteImagesMapToVertexMedia(t *testing.T) {
 	content := []interface{}{
 		map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "url", "url": "https://example.com/a.png", "media_type": "image/png"}},

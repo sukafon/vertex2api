@@ -22,6 +22,7 @@ type ModelCatalog struct {
 	geminiList         GeminiModelListResponse
 	anthropicList      AnthropicModelListResponse
 	responseModalities map[string]map[string]bool
+	thinkingLevels     map[string]map[string]bool
 	safetySettings     map[string]map[string]map[string]bool
 }
 
@@ -42,6 +43,24 @@ type rawCatalogModel struct {
 type rawCatalogParameter struct {
 	Name              string                  `json:"name"`
 	NumericRangeValue *rawCatalogNumericRange `json:"numericRangeValue"`
+	raw               json.RawMessage
+}
+
+func (p *rawCatalogParameter) UnmarshalJSON(data []byte) error {
+	type knownFields struct {
+		Name              string                  `json:"name"`
+		NumericRangeValue *rawCatalogNumericRange `json:"numericRangeValue"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	var known knownFields
+	if err := decoder.Decode(&known); err != nil {
+		return err
+	}
+	p.Name = known.Name
+	p.NumericRangeValue = known.NumericRangeValue
+	p.raw = append(p.raw[:0], data...)
+	return nil
 }
 
 type rawCatalogNumericRange struct {
@@ -175,6 +194,68 @@ func SanitizeGenerationConfigResponseModalities(modelName string, genConfig map[
 	genConfig["responseModalities"] = modalities
 }
 
+// SupportedThinkingLevels returns the ordered thinking levels advertised by
+// the current upstream-backed model catalog. The bool is false when the model
+// list did not publish a thinking-level capability for this model.
+func SupportedThinkingLevels(modelName string) ([]string, bool) {
+	catalogMu.RLock()
+	allowed, ok := defaultCatalog.thinkingLevels[normalizeCatalogModelID(modelName)]
+	catalogMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	levels := make([]string, 0, len(allowed))
+	for _, level := range orderedThinkingLevels {
+		if allowed[level] {
+			levels = append(levels, level)
+		}
+	}
+	return levels, true
+}
+
+func LowestSupportedThinkingLevel(modelName string) (string, bool) {
+	levels, ok := SupportedThinkingLevels(modelName)
+	if !ok || len(levels) == 0 {
+		return "", false
+	}
+	return levels[0], true
+}
+
+// SanitizeGenerationConfigThinkingLevel clamps an explicitly requested level
+// to the nearest level published by the upstream model list. Prefer promoting
+// the request so an unsupported lower level does not cause a Vertex Code 3.
+func SanitizeGenerationConfigThinkingLevel(modelName string, genConfig map[string]interface{}) {
+	if genConfig == nil {
+		return
+	}
+	thinkingConfig, ok := genConfig["thinkingConfig"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	requested, ok := thinkingConfig["thinkingLevel"].(string)
+	if !ok {
+		return
+	}
+	requested = normalizeThinkingLevel(requested)
+	if requested == "" {
+		return
+	}
+
+	catalogMu.RLock()
+	allowed, known := defaultCatalog.thinkingLevels[normalizeCatalogModelID(modelName)]
+	catalogMu.RUnlock()
+	if !known || len(allowed) == 0 {
+		return
+	}
+	if allowed[requested] {
+		thinkingConfig["thinkingLevel"] = requested
+		return
+	}
+	if replacement := closestSupportedThinkingLevel(requested, allowed); replacement != "" {
+		thinkingConfig["thinkingLevel"] = replacement
+	}
+}
+
 func loadDefaultCatalog() ModelCatalog {
 	catalog, err := loadModelCatalogFromFile(defaultModelJSONName)
 	if err == nil {
@@ -237,6 +318,7 @@ func buildModelCatalog(models []rawCatalogModel) ModelCatalog {
 	geminiModels := make([]GeminiModelInfo, 0, len(models))
 	anthropicModels := make([]AnthropicModelInfo, 0, len(models))
 	responseModalities := make(map[string]map[string]bool, len(models))
+	thinkingLevels := make(map[string]map[string]bool, len(models))
 	safetySettings := make(map[string]map[string]map[string]bool, len(models))
 
 	for _, item := range models {
@@ -277,6 +359,9 @@ func buildModelCatalog(models []rawCatalogModel) ModelCatalog {
 
 		modalities := responseModalitiesForModel(item)
 		responseModalities[normalizeCatalogModelID(modelID)] = modalities
+		if levels, published := thinkingLevelsForModel(item); published {
+			thinkingLevels[normalizeCatalogModelID(modelID)] = levels
+		}
 
 		sSettings := safetySettingsForModel(item)
 		safetySettings[normalizeCatalogModelID(modelID)] = sSettings
@@ -298,6 +383,7 @@ func buildModelCatalog(models []rawCatalogModel) ModelCatalog {
 			Models: geminiModels,
 		},
 		responseModalities: responseModalities,
+		thinkingLevels:     thinkingLevels,
 		safetySettings:     safetySettings,
 	}
 }
@@ -416,6 +502,87 @@ func responseModalitiesForModel(item rawCatalogModel) map[string]bool {
 		modalities["TEXT"] = true
 	}
 	return modalities
+}
+
+var orderedThinkingLevels = []string{"MINIMAL", "LOW", "MEDIUM", "HIGH"}
+
+func thinkingLevelsForModel(item rawCatalogModel) (map[string]bool, bool) {
+	for _, parameter := range item.Parameters {
+		name := normalizeCatalogParameterName(parameter.Name)
+		if name != "thinkinglevel" && name != "reasoninglevel" {
+			continue
+		}
+		levels := make(map[string]bool, len(orderedThinkingLevels))
+		if len(parameter.raw) > 0 {
+			var value interface{}
+			if err := json.Unmarshal(parameter.raw, &value); err == nil {
+				collectThinkingLevels(value, levels)
+			}
+		}
+		return levels, true
+	}
+	return nil, false
+}
+
+func collectThinkingLevels(value interface{}, levels map[string]bool) {
+	switch typed := value.(type) {
+	case string:
+		if level := normalizeThinkingLevel(typed); level != "" {
+			levels[level] = true
+		}
+	case []interface{}:
+		for _, item := range typed {
+			collectThinkingLevels(item, levels)
+		}
+	case map[string]interface{}:
+		for _, item := range typed {
+			collectThinkingLevels(item, levels)
+		}
+	}
+}
+
+func normalizeCatalogParameterName(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return unicode.ToLower(r)
+		}
+		return -1
+	}, value)
+}
+
+func normalizeThinkingLevel(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "THINKING_LEVEL_")
+	for _, level := range orderedThinkingLevels {
+		if value == level {
+			return level
+		}
+	}
+	return ""
+}
+
+func closestSupportedThinkingLevel(requested string, allowed map[string]bool) string {
+	requestedIndex := -1
+	for index, level := range orderedThinkingLevels {
+		if level == requested {
+			requestedIndex = index
+			break
+		}
+	}
+	if requestedIndex < 0 {
+		return ""
+	}
+	for index := requestedIndex + 1; index < len(orderedThinkingLevels); index++ {
+		if allowed[orderedThinkingLevels[index]] {
+			return orderedThinkingLevels[index]
+		}
+	}
+	for index := requestedIndex - 1; index >= 0; index-- {
+		if allowed[orderedThinkingLevels[index]] {
+			return orderedThinkingLevels[index]
+		}
+	}
+	return ""
 }
 
 func sanitizeResponseModalities(value interface{}, allowed map[string]bool) []string {

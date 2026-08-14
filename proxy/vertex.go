@@ -528,6 +528,7 @@ func sanitizeThinkingConfig(modelName string, genConfig map[string]interface{}) 
 	}
 
 	normalizeThinkingLevel(thinkingConfig)
+	model.SanitizeGenerationConfigThinkingLevel(modelName, genConfig)
 
 	isGemini3 := strings.HasPrefix(modelName, "gemini-3")
 	isGemini25 := strings.HasPrefix(modelName, "gemini-2.5")

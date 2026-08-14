@@ -282,11 +282,6 @@ func openAIReasoningConfig(modelName string, effort *string) map[string]interfac
 		if normalized == "xhigh" || normalized == "max" {
 			level = "HIGH"
 		}
-		// Gemini Pro models do not expose a minimal level; Google's OpenAI
-		// compatibility mapping promotes that request to low.
-		if normalized == "minimal" && strings.Contains(lowerModel, "pro") {
-			level = "LOW"
-		}
 		return map[string]interface{}{"thinkingLevel": level}
 	}
 

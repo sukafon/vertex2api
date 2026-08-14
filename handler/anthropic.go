@@ -1085,12 +1085,29 @@ func buildAnthropicGenerationConfig(req model.AnthropicMessageRequest) map[strin
 			thinkingConfig["includeThoughts"] = true
 			genConfig["thinkingConfig"] = thinkingConfig
 		}
+	} else if thinkingConfig := defaultAnthropicThinkingConfig(req.Model); thinkingConfig != nil {
+		// An Anthropic request that does not enable thinking expects max_tokens
+		// to remain useful for the visible answer. Gemini 3 defaults to dynamic
+		// thinking, which can consume a small Anthropic output budget before any
+		// text is returned. Use the lowest level that the current upstream model
+		// catalog advertises because Gemini 3 cannot disable thinking completely
+		// and support for MINIMAL differs by model version.
+		thinkingConfig["includeThoughts"] = false
+		genConfig["thinkingConfig"] = thinkingConfig
 	}
 	if format, _ := req.OutputConfig["format"].(map[string]interface{}); len(format) > 0 {
 		genConfig["responseMimeType"] = "application/json"
 		genConfig["responseJsonSchema"] = schemanorm.Normalize(format["schema"])
 	}
 	return genConfig
+}
+
+func defaultAnthropicThinkingConfig(modelName string) map[string]interface{} {
+	level, ok := model.LowestSupportedThinkingLevel(modelName)
+	if !ok {
+		return nil
+	}
+	return map[string]interface{}{"thinkingLevel": level}
 }
 
 func convertAnthropicThinking(thinking map[string]interface{}) map[string]interface{} {

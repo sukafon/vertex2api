@@ -14,7 +14,7 @@
 
 - 内部使用有序 Vertex Part 表示响应，不先压平成文本；原生 Gemini 会保留候选边界、Part 顺序、角色、图片/文件、函数调用与结果、代码执行、思考签名、结束原因、grounding、安全评级和候选元数据。
 - 将 OpenAI/Anthropic 工具 Schema 归一化为 Vertex 可接受的 JSON Schema，不修改调用者的原始对象；协议没有等价字段时采用下表中的显式降级，不伪造另一个供应商的 opaque 数据。
-- Chat Completions 和 Responses 的显式 `reasoning_effort` 会映射到 Gemini 3 `thinkingLevel` 或 Gemini 2.5 `thinkingBudget`；`xhigh`/`max` 会静默降级为 Gemini 可表达的 `high`，省略该字段时保留模型默认思考配置，不依据 token 上限自动降级。Responses 的 `namespace` 工具会展开为 `namespace__tool` 形式的 Vertex 函数声明；响应时恢复为独立的 `namespace` 与子工具 `name` 供 Codex 分派，下一轮输入再无损还原为 Vertex 扁平名。
+- Chat Completions 和 Responses 的显式 `reasoning_effort` 会映射到 Gemini 3 `thinkingLevel` 或 Gemini 2.5 `thinkingBudget`；`xhigh`/`max` 会降级为 Gemini 可表达的 `high`，其他 Gemini 3 等级会根据上游模型目录发布的 `thinking_level` 枚举约束到最近可用值。省略该字段时保留模型默认思考配置，不依据 token 上限自动降级；Anthropic Messages 省略 thinking/effort 时则使用目录中该模型支持的最低思考等级，目录未发布能力时不猜测。Responses 的 `namespace` 工具会展开为 `namespace__tool` 形式的 Vertex 函数声明；响应时恢复为独立的 `namespace` 与子工具 `name` 供 Codex 分派，下一轮输入再无损还原为 Vertex 扁平名。
 - 对 `gemini-3.6-*` 移除末尾 model 预填充，适配该版本不接受 model turn 结尾的请求约束；这不是把内容改写成 `systemInstruction`，其他模型保留原行为。
 - Responses 支持无状态字符串/输入项数组、文本、data URL/远程图片、内联/远程文件、音频、函数工具、custom、local_shell、shell、apply_patch、Vertex 等价的 `web_search`、`code_interpreter`、`url_context`、结构化输出、refusal、URL citation、web-search call 和完整 SSE 生命周期；不实现 `previous_response_id`、OpenAI Files、后台任务或 `file_search`。
 - Anthropic Messages 支持思考及签名流、工具流、图片、PDF/文本/URL document、`output_config.format` 结构化输出和 `output_config.effort`。Vertex grounding 无法生成 Anthropic web-search citation 所要求的 `encrypted_index`/`encrypted_content`，因此不会伪造 Anthropic citation block。

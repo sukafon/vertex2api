@@ -14,6 +14,7 @@ func TestLoadModelCatalogFromOptionalJSON(t *testing.T) {
         "publisherId":"google",
         "modelFamily":"gemini",
         "releaseDate":"2026-06-18",
+		"parameters":[{"name":"thinking_level","enumValue":{"options":[{"value":"LOW"},{"value":"MEDIUM"},{"value":"HIGH"}]}}],
         "taskConfigs":[{"outputConfig":{"supportedContentTypes":[{"type":"text"},{"type":"image"}]}}]
     }]`)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -37,6 +38,46 @@ func TestLoadModelCatalogFromOptionalJSON(t *testing.T) {
 	}
 	if !catalog.responseModalities["gemini-image-test"]["IMAGE"] {
 		t.Fatal("fixture model should support IMAGE output")
+	}
+	levels := catalog.thinkingLevels["gemini-image-test"]
+	if len(levels) != 3 || !levels["LOW"] || !levels["MEDIUM"] || !levels["HIGH"] || levels["MINIMAL"] {
+		t.Fatalf("fixture thinking levels = %#v, want LOW/MEDIUM/HIGH", levels)
+	}
+}
+
+func TestCatalogThinkingLevelSelectionAndSanitization(t *testing.T) {
+	catalogMu.RLock()
+	originalCatalog := defaultCatalog
+	catalogMu.RUnlock()
+	t.Cleanup(func() { SetCatalog(originalCatalog) })
+
+	parameterJSON := json.RawMessage(`{"name":"thinkingLevel","enumValue":{"values":["THINKING_LEVEL_LOW","MEDIUM","HIGH"]}}`)
+	SetCatalog(buildModelCatalog([]rawCatalogModel{{
+		ModelID: "gemini-catalog-thinking",
+		Parameters: []rawCatalogParameter{{
+			Name: "thinkingLevel",
+			raw:  parameterJSON,
+		}},
+	}}))
+
+	levels, ok := SupportedThinkingLevels("models/gemini-catalog-thinking")
+	if !ok || len(levels) != 3 || levels[0] != "LOW" || levels[1] != "MEDIUM" || levels[2] != "HIGH" {
+		t.Fatalf("SupportedThinkingLevels = %v, %v", levels, ok)
+	}
+	if lowest, ok := LowestSupportedThinkingLevel("gemini-catalog-thinking"); !ok || lowest != "LOW" {
+		t.Fatalf("LowestSupportedThinkingLevel = %q, %v, want LOW, true", lowest, ok)
+	}
+
+	config := map[string]interface{}{"thinkingConfig": map[string]interface{}{"thinkingLevel": "minimal"}}
+	SanitizeGenerationConfigThinkingLevel("gemini-catalog-thinking", config)
+	if got := config["thinkingConfig"].(map[string]interface{})["thinkingLevel"]; got != "LOW" {
+		t.Fatalf("sanitized thinkingLevel = %v, want LOW", got)
+	}
+
+	unknown := map[string]interface{}{"thinkingConfig": map[string]interface{}{"thinkingLevel": "MINIMAL"}}
+	SanitizeGenerationConfigThinkingLevel("gemini-not-in-catalog", unknown)
+	if got := unknown["thinkingConfig"].(map[string]interface{})["thinkingLevel"]; got != "MINIMAL" {
+		t.Fatalf("unknown model thinkingLevel = %v, want unchanged MINIMAL", got)
 	}
 }
 

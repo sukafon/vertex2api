@@ -984,7 +984,7 @@ func TestOpenAIReasoningConfigMapsExplicitEffort(t *testing.T) {
 		{name: "Gemini 3.6 xhigh degrades to high", modelName: "gemini-3.6-flash", effort: "xhigh", key: "thinkingLevel", want: "HIGH"},
 		{name: "Gemini 3.6 max degrades to high", modelName: "gemini-3.6-flash", effort: "max", key: "thinkingLevel", want: "HIGH"},
 		{name: "Gemini 3 medium", modelName: "gemini-3-flash-preview", effort: "medium", key: "thinkingLevel", want: "MEDIUM"},
-		{name: "Gemini 3 Pro promotes minimal", modelName: "gemini-3.1-pro-preview", effort: "minimal", key: "thinkingLevel", want: "LOW"},
+		{name: "Gemini 3 Pro defers minimal capability to catalog", modelName: "gemini-3.1-pro-preview", effort: "minimal", key: "thinkingLevel", want: "MINIMAL"},
 		{name: "Gemini 2.5 low", modelName: "gemini-2.5-flash", effort: "low", key: "thinkingBudget", want: 1024},
 		{name: "Gemini 2.5 medium", modelName: "gemini-2.5-flash", effort: "medium", key: "thinkingBudget", want: 8192},
 		{name: "Gemini 2.5 high", modelName: "gemini-2.5-flash", effort: "high", key: "thinkingBudget", want: 24576},
